@@ -1,19 +1,17 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <fstream>
 #include "data_store.h"
 #include "ui_theme.h"
 #include "tray.h"
 
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "msimg32.lib")
-
 // 控件与交互常量
 #define ID_EDIT_INPUT   1001
-#define ID_BTN_ADD      1002
 #define ID_EDIT_MEMO    1003
 #define ID_TIMER_SAVE   1004
 
@@ -22,35 +20,38 @@ static HINSTANCE g_hInstance = NULL;
 static HWND g_hOwnerWnd = NULL;
 static HWND g_hMainWnd = NULL;
 static HWND g_hEditInput = NULL;
-static HWND g_hBtnAdd = NULL;
 static HWND g_hEditMemo = NULL;
+static WNDPROC g_oldEditInputProc = NULL;
 
+static HFONT g_hFontTitle = NULL;
 static HFONT g_hFontNormal = NULL;
-static HFONT g_hFontBold = NULL;
 static HFONT g_hFontStrike = NULL;
 static HFONT g_hFontSmall = NULL;
+static HFONT g_hFontIcon = NULL;
 
 static AppData g_appData;
 static int g_scrollOffset = 0;
 static int g_hoveredItemIdx = -1;
 static int g_hoveredDeleteIdx = -1;
+static int g_hoveredHeaderBtn = 0; // 1: Pin, 2: Theme, 3: Close/Min
 
 // 布局常量
-static const int HEADER_HEIGHT = 38;
-static const int TAB_HEIGHT = 32;
-static const int PROGRESS_HEIGHT = 46;
+static const int HEADER_HEIGHT = 44;
+static const int TAB_HEIGHT = 36;
+static const int PROGRESS_AREA_HEIGHT = 48;
 static const int INPUT_AREA_HEIGHT = 44;
-static const int ITEM_HEIGHT = 36;
-static const int PADDING = 12;
+static const int ITEM_HEIGHT = 40;
+static const int PADDING = 14;
 
 // 函数声明
 LRESULT CALLBACK OwnerWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK EditInputSubclassProc(HWND, UINT, WPARAM, LPARAM);
 void SaveDataDeferred(HWND hwnd);
 void UpdateControlVisibility();
 void LayoutControls(int width, int height);
 
-// 计算待办进度
+// 统计进度
 static void GetTodoStats(int& completed, int& total, float& percent) {
     total = (int)g_appData.todos.size();
     completed = 0;
@@ -60,188 +61,237 @@ static void GetTodoStats(int& completed, int& total, float& percent) {
     percent = (total == 0) ? 0.0f : ((float)completed / (float)total);
 }
 
-// 绘制双缓冲窗口内容
+// 绘制平滑圆角矩形
+static void DrawModernRoundRect(HDC hdc, const RECT& rc, int radius, COLORREF fillColor, COLORREF borderColor) {
+    HBRUSH brush = CreateSolidBrush(fillColor);
+    HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
+
+// 双缓冲渲染现代化 Microsoft 便笺界面
 static void Render(HWND hwnd, HDC hdc) {
     RECT clientRc;
     GetClientRect(hwnd, &clientRc);
     int width = clientRc.right - clientRc.left;
     int height = clientRc.bottom - clientRc.top;
 
-    // 内存 DC 双缓冲防止闪烁
+    ColorScheme colors = GetThemeColors(g_appData.colorTheme);
+
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
     HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
 
-    // 1. 背景填充
-    HBRUSH bgBrush = CreateSolidBrush(Theme::BG_COLOR);
-    FillRect(memDC, &clientRc, bgBrush);
-    DeleteObject(bgBrush);
+    // 1. 整体底色填充
+    HBRUSH bodyBrush = CreateSolidBrush(colors.bodyBg);
+    FillRect(memDC, &clientRc, bodyBrush);
+    DeleteObject(bodyBrush);
 
-    // 2. 顶部拖拽标题栏 (Header)
+    // 2. 顶部 Fluent 导航栏
     RECT headerRc = { 0, 0, width, HEADER_HEIGHT };
-    HBRUSH headerBrush = CreateSolidBrush(Theme::HEADER_BG);
+    HBRUSH headerBrush = CreateSolidBrush(colors.headerBg);
     FillRect(memDC, &headerRc, headerBrush);
     DeleteObject(headerBrush);
 
-    // 绘制标题与图标文字
+    // 绘制标题
     SetBkMode(memDC, TRANSPARENT);
-    SelectObject(memDC, g_hFontBold);
-    SetTextColor(memDC, Theme::TEXT_MAIN);
-    RECT titleRc = { PADDING, 0, width - 100, HEADER_HEIGHT };
-    DrawTextW(memDC, L"📌 随手便签 & 进度", -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    SelectObject(memDC, g_hFontTitle);
+    SetTextColor(memDC, colors.textPrimary);
+    RECT titleRc = { PADDING, 0, width - 120, HEADER_HEIGHT };
+    DrawTextW(memDC, L"便笺 & 进度跟踪", -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-    // 置顶按钮指示 & 最小化按钮
+    // 顶部右侧现代化小胶囊按钮: [📌 置顶] [🎨 换色] [× 隐藏]
+    int btnY = (HEADER_HEIGHT - 26) / 2;
+    int btnH = 26;
+
+    // 置顶按钮
+    RECT pinBtnRc = { width - 100, btnY, width - 70, btnY + btnH };
+    if (g_hoveredHeaderBtn == 1 || g_appData.isAlwaysOnTop) {
+        DrawModernRoundRect(memDC, pinBtnRc, 6, g_appData.isAlwaysOnTop ? colors.accent : colors.hoverOverlay, colors.cardBorder);
+        SetTextColor(memDC, g_appData.isAlwaysOnTop ? RGB(255, 255, 255) : colors.textPrimary);
+    } else {
+        SetTextColor(memDC, colors.textSecondary);
+    }
     SelectObject(memDC, g_hFontNormal);
-    RECT pinBtnRc = { width - 66, 6, width - 36, HEADER_HEIGHT - 6 };
-    RECT minBtnRc = { width - 32, 6, width - 8, HEADER_HEIGHT - 6 };
-    
-    SetTextColor(memDC, g_appData.isAlwaysOnTop ? RGB(220, 38, 38) : Theme::TEXT_MUTED);
-    DrawTextW(memDC, g_appData.isAlwaysOnTop ? L"[顶]" : L" 置顶", -1, &pinBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    DrawTextW(memDC, L"📌", -1, &pinBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    SetTextColor(memDC, Theme::TEXT_MUTED);
-    DrawTextW(memDC, L" 一 ", -1, &minBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    // 切换颜色按钮
+    RECT themeBtnRc = { width - 66, btnY, width - 38, btnY + btnH };
+    if (g_hoveredHeaderBtn == 2) {
+        DrawModernRoundRect(memDC, themeBtnRc, 6, colors.hoverOverlay, colors.cardBorder);
+    }
+    SetTextColor(memDC, colors.textSecondary);
+    DrawTextW(memDC, L"🎨", -1, &themeBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    // 顶部与内容分隔线
-    HPEN borderPen = CreatePen(PS_SOLID, 1, Theme::BORDER_COLOR);
-    HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
-    MoveToEx(memDC, 0, HEADER_HEIGHT - 1, NULL);
-    LineTo(memDC, width, HEADER_HEIGHT - 1);
+    // 隐藏/最小化按钮
+    RECT closeBtnRc = { width - 34, btnY, width - 8, btnY + btnH };
+    if (g_hoveredHeaderBtn == 3) {
+        DrawModernRoundRect(memDC, closeBtnRc, 6, RGB(254, 226, 226), RGB(248, 113, 113));
+        SetTextColor(memDC, RGB(220, 38, 38));
+    } else {
+        SetTextColor(memDC, colors.textSecondary);
+    }
+    DrawTextW(memDC, L"×", -1, &closeBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    // 3. 标签切换栏 (Tab 0: 待办跟踪, Tab 1: 自由速记)
+    // 3. 现代化 Tab 切换栏
     int tabY = HEADER_HEIGHT;
-    RECT tab1Rc = { 0, tabY, width / 2, tabY + TAB_HEIGHT };
-    RECT tab2Rc = { width / 2, tabY, width, tabY + TAB_HEIGHT };
+    int tabWidth = width / 2;
+    RECT tab1Rc = { 0, tabY, tabWidth, tabY + TAB_HEIGHT };
+    RECT tab2Rc = { tabWidth, tabY, width, tabY + TAB_HEIGHT };
 
-    // 绘制 Tab 状态
+    // Tab 1 (待办进度)
     if (g_appData.currentTab == 0) {
-        HBRUSH activeBrush = CreateSolidBrush(Theme::BG_COLOR);
-        FillRect(memDC, &tab1Rc, activeBrush);
-        DeleteObject(activeBrush);
-    } else {
-        HBRUSH inActiveBrush = CreateSolidBrush(Theme::HEADER_BG);
-        FillRect(memDC, &tab1Rc, inActiveBrush);
-        DeleteObject(inActiveBrush);
-    }
+        HBRUSH tBrush = CreateSolidBrush(colors.bodyBg);
+        FillRect(memDC, &tab1Rc, tBrush);
+        DeleteObject(tBrush);
 
+        // 下划指示胶囊条
+        RECT indRc = { tabWidth / 2 - 32, tabY + TAB_HEIGHT - 3, tabWidth / 2 + 32, tabY + TAB_HEIGHT };
+        HBRUSH indBrush = CreateSolidBrush(colors.accent);
+        FillRect(memDC, &indRc, indBrush);
+        DeleteObject(indBrush);
+
+        SelectObject(memDC, g_hFontTitle);
+        SetTextColor(memDC, colors.textPrimary);
+    } else {
+        SelectObject(memDC, g_hFontNormal);
+        SetTextColor(memDC, colors.textSecondary);
+    }
+    DrawTextW(memDC, L"待办进度", -1, &tab1Rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+    // Tab 2 (速记笔记)
     if (g_appData.currentTab == 1) {
-        HBRUSH activeBrush = CreateSolidBrush(Theme::BG_COLOR);
-        FillRect(memDC, &tab2Rc, activeBrush);
-        DeleteObject(activeBrush);
+        HBRUSH tBrush = CreateSolidBrush(colors.bodyBg);
+        FillRect(memDC, &tab2Rc, tBrush);
+        DeleteObject(tBrush);
+
+        RECT indRc = { tabWidth + tabWidth / 2 - 32, tabY + TAB_HEIGHT - 3, tabWidth + tabWidth / 2 + 32, tabY + TAB_HEIGHT };
+        HBRUSH indBrush = CreateSolidBrush(colors.accent);
+        FillRect(memDC, &indRc, indBrush);
+        DeleteObject(indBrush);
+
+        SelectObject(memDC, g_hFontTitle);
+        SetTextColor(memDC, colors.textPrimary);
     } else {
-        HBRUSH inActiveBrush = CreateSolidBrush(Theme::HEADER_BG);
-        FillRect(memDC, &tab2Rc, inActiveBrush);
-        DeleteObject(inActiveBrush);
+        SelectObject(memDC, g_hFontNormal);
+        SetTextColor(memDC, colors.textSecondary);
     }
+    DrawTextW(memDC, L"速记笔记", -1, &tab2Rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    SelectObject(memDC, g_appData.currentTab == 0 ? g_hFontBold : g_hFontNormal);
-    SetTextColor(memDC, g_appData.currentTab == 0 ? Theme::TEXT_MAIN : Theme::TEXT_MUTED);
-    DrawTextW(memDC, L"📋 待办进度", -1, &tab1Rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-
-    SelectObject(memDC, g_appData.currentTab == 1 ? g_hFontBold : g_hFontNormal);
-    SetTextColor(memDC, g_appData.currentTab == 1 ? Theme::TEXT_MAIN : Theme::TEXT_MUTED);
-    DrawTextW(memDC, L"📝 自由速记", -1, &tab2Rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-
-    // Tab 下方边线
+    // Tab 底部柔和分割线
+    HPEN splitPen = CreatePen(PS_SOLID, 1, colors.cardBorder);
+    HPEN oldPen = (HPEN)SelectObject(memDC, splitPen);
     MoveToEx(memDC, 0, tabY + TAB_HEIGHT - 1, NULL);
     LineTo(memDC, width, tabY + TAB_HEIGHT - 1);
-    MoveToEx(memDC, width / 2, tabY, NULL);
-    LineTo(memDC, width / 2, tabY + TAB_HEIGHT);
+    SelectObject(memDC, oldPen);
+    DeleteObject(splitPen);
 
-    // 4. Tab 0: 待办清单与进度条
+    // 4. Tab 0: 待办进度
     if (g_appData.currentTab == 0) {
         int compCount = 0, totalCount = 0;
         float percent = 0.0f;
         GetTodoStats(compCount, totalCount, percent);
 
-        // 4.1 进度条区域
+        // 4.1 进度条区域卡片化
         int progY = tabY + TAB_HEIGHT + 8;
-        RECT progTextRc = { PADDING, progY, width - PADDING, progY + 18 };
+        RECT progCardRc = { PADDING, progY, width - PADDING, progY + PROGRESS_AREA_HEIGHT };
+        DrawModernRoundRect(memDC, progCardRc, 8, colors.cardBg, colors.cardBorder);
+
+        // 文字
+        RECT progTextRc = { PADDING + 12, progY + 6, width - PADDING - 12, progY + 24 };
         SelectObject(memDC, g_hFontSmall);
-        SetTextColor(memDC, Theme::TEXT_MUTED);
+        SetTextColor(memDC, colors.textSecondary);
 
         wchar_t statText[64];
-        swprintf_s(statText, L"当前进度：%d / %d 项 (%.0f%%)", compCount, totalCount, percent * 100.0f);
+        swprintf_s(statText, L"今日进度：%d / %d 项 (%.0f%%)", compCount, totalCount, percent * 100.0f);
         DrawTextW(memDC, statText, -1, &progTextRc, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
-        // 绘制进度条外槽
-        int barY = progY + 22;
-        int barHeight = 8;
-        int barWidth = width - PADDING * 2;
-        RECT barBgRc = { PADDING, barY, PADDING + barWidth, barY + barHeight };
-        HBRUSH barBgBrush = CreateSolidBrush(Theme::PROGRESS_BG);
-        FillRect(memDC, &barBgRc, barBgBrush);
-        DeleteObject(barBgBrush);
+        // 进度条槽
+        int barY = progY + 28;
+        int barH = 8;
+        int barW = width - PADDING * 2 - 24;
+        RECT barBgRc = { PADDING + 12, barY, PADDING + 12 + barW, barY + barH };
+        DrawModernRoundRect(memDC, barBgRc, 4, colors.progressBg, colors.progressBg);
 
-        // 绘制进度条填充（平滑圆角或整齐条）
-        int fillWidth = (int)(barWidth * percent);
-        if (fillWidth > 0) {
-            RECT barFillRc = { PADDING, barY, PADDING + fillWidth, barY + barHeight };
-            HBRUSH barFillBrush = CreateSolidBrush(Theme::ACCENT_GREEN);
-            FillRect(memDC, &barFillRc, barFillBrush);
-            DeleteObject(barFillBrush);
+        int fillW = (int)(barW * percent);
+        if (fillW > 0) {
+            RECT barFillRc = { PADDING + 12, barY, PADDING + 12 + fillW, barY + barH };
+            DrawModernRoundRect(memDC, barFillRc, 4, colors.accent, colors.accent);
         }
 
-        // 4.2 待办列表项渲染
-        int listStartY = HEADER_HEIGHT + TAB_HEIGHT + PROGRESS_HEIGHT + INPUT_AREA_HEIGHT + 8;
+        // 4.2 输入框外框卡片渲染
+        int inputCardY = progY + PROGRESS_AREA_HEIGHT + 8;
+        RECT inputCardRc = { PADDING, inputCardY, width - PADDING, inputCardY + 36 };
+        DrawModernRoundRect(memDC, inputCardRc, 8, colors.cardBg, colors.cardBorder);
+
+        // 4.3 待办事项列表卡片渲染
+        int listStartY = inputCardY + 36 + 10;
         int listEndY = height - PADDING;
         int currentY = listStartY - g_scrollOffset;
 
         if (g_appData.todos.empty()) {
-            RECT emptyRc = { 0, listStartY + 40, width, listStartY + 100 };
+            RECT emptyRc = { 0, listStartY + 30, width, listStartY + 100 };
             SelectObject(memDC, g_hFontNormal);
-            SetTextColor(memDC, Theme::TEXT_MUTED);
-            DrawTextW(memDC, L"暂无待办，在上方的输入框添加一个吧 ~", -1, &emptyRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            SetTextColor(memDC, colors.textSecondary);
+            DrawTextW(memDC, L"✨ 暂无待办，输入后按回车快速添加", -1, &emptyRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         } else {
             for (size_t i = 0; i < g_appData.todos.size(); ++i) {
                 if (currentY + ITEM_HEIGHT > listStartY && currentY < listEndY) {
-                    RECT itemRc = { PADDING, currentY, width - PADDING, currentY + ITEM_HEIGHT };
+                    RECT itemRc = { PADDING, currentY, width - PADDING, currentY + ITEM_HEIGHT - 4 };
 
-                    // 悬浮高亮
-                    if ((int)i == g_hoveredItemIdx) {
-                        HBRUSH hoverBrush = CreateSolidBrush(Theme::ITEM_HOVER);
-                        FillRect(memDC, &itemRc, hoverBrush);
-                        DeleteObject(hoverBrush);
-                    }
+                    // 悬浮微阴影与高亮
+                    bool isHovered = ((int)i == g_hoveredItemIdx);
+                    COLORREF itemBg = isHovered ? colors.hoverOverlay : colors.cardBg;
+                    DrawModernRoundRect(memDC, itemRc, 8, itemBg, colors.cardBorder);
 
-                    // 绘制复选框外框 (16x16)
-                    int boxSize = 16;
-                    int boxX = PADDING + 6;
-                    int boxY = currentY + (ITEM_HEIGHT - boxSize) / 2;
+                    // 圆形复选框
+                    int boxSize = 18;
+                    int boxX = PADDING + 10;
+                    int boxY = currentY + (ITEM_HEIGHT - 4 - boxSize) / 2;
                     RECT checkRc = { boxX, boxY, boxX + boxSize, boxY + boxSize };
-                    
-                    HBRUSH checkBg = CreateSolidBrush(g_appData.todos[i].completed ? Theme::ACCENT_GREEN : RGB(255, 255, 255));
-                    FillRect(memDC, &checkRc, checkBg);
-                    DeleteObject(checkBg);
 
-                    HPEN boxPen = CreatePen(PS_SOLID, 1, g_appData.todos[i].completed ? Theme::ACCENT_GREEN : Theme::CHECKBOX_BORDER);
-                    HPEN oldBoxPen = (HPEN)SelectObject(memDC, boxPen);
-                    Rectangle(memDC, checkRc.left, checkRc.top, checkRc.right, checkRc.bottom);
-                    SelectObject(memDC, oldBoxPen);
-                    DeleteObject(boxPen);
-
-                    // 勾选标记 '✓'
                     if (g_appData.todos[i].completed) {
+                        DrawModernRoundRect(memDC, checkRc, boxSize, colors.accent, colors.accent);
                         SetTextColor(memDC, RGB(255, 255, 255));
                         SelectObject(memDC, g_hFontSmall);
                         DrawTextW(memDC, L"✓", -1, &checkRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                    } else {
+                        DrawModernRoundRect(memDC, checkRc, boxSize, colors.cardBg, colors.cardBorder);
                     }
 
                     // 文本
-                    RECT textRc = { boxX + boxSize + 10, currentY, width - PADDING - 32, currentY + ITEM_HEIGHT };
+                    RECT textRc = { boxX + boxSize + 12, currentY, width - PADDING - 36, currentY + ITEM_HEIGHT - 4 };
                     if (g_appData.todos[i].completed) {
                         SelectObject(memDC, g_hFontStrike);
-                        SetTextColor(memDC, Theme::COMPLETED_TEXT);
+                        SetTextColor(memDC, colors.completedText);
                     } else {
                         SelectObject(memDC, g_hFontNormal);
-                        SetTextColor(memDC, Theme::TEXT_MAIN);
+                        SetTextColor(memDC, colors.textPrimary);
                     }
                     DrawTextW(memDC, g_appData.todos[i].text.c_str(), -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
 
-                    // 删除按钮 [×]（仅悬浮行时展示）
-                    if ((int)i == g_hoveredItemIdx) {
-                        RECT delRc = { width - PADDING - 26, currentY + 6, width - PADDING - 4, currentY + ITEM_HEIGHT - 6 };
+                    // 悬浮删除小圆钮
+                    if (isHovered) {
+                        int delSize = 22;
+                        int delX = width - PADDING - 30;
+                        int delY = currentY + (ITEM_HEIGHT - 4 - delSize) / 2;
+                        RECT delRc = { delX, delY, delX + delSize, delY + delSize };
+
+                        bool isDelHover = ((int)i == g_hoveredDeleteIdx);
+                        if (isDelHover) {
+                            DrawModernRoundRect(memDC, delRc, 6, RGB(254, 226, 226), RGB(248, 113, 113));
+                            SetTextColor(memDC, RGB(220, 38, 38));
+                        } else {
+                            SetTextColor(memDC, colors.textSecondary);
+                        }
                         SelectObject(memDC, g_hFontNormal);
-                        SetTextColor(memDC, ((int)i == g_hoveredDeleteIdx) ? RGB(239, 68, 68) : Theme::TEXT_MUTED);
                         DrawTextW(memDC, L"×", -1, &delRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
                     }
                 }
@@ -250,18 +300,17 @@ static void Render(HWND hwnd, HDC hdc) {
         }
     }
 
-    // 5. 窗口最外层 1px 优雅描边
-    SelectObject(memDC, borderPen);
+    // 5. 最外圈轻量精致边框
+    HPEN outPen = CreatePen(PS_SOLID, 1, colors.cardBorder);
+    HPEN prevPen = (HPEN)SelectObject(memDC, outPen);
     MoveToEx(memDC, 0, 0, NULL);
     LineTo(memDC, width - 1, 0);
     LineTo(memDC, width - 1, height - 1);
     LineTo(memDC, 0, height - 1);
     LineTo(memDC, 0, 0);
+    SelectObject(memDC, prevPen);
+    DeleteObject(outPen);
 
-    SelectObject(memDC, oldPen);
-    DeleteObject(borderPen);
-
-    // 一次性贴回屏幕
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
     SelectObject(memDC, oldBitmap);
     DeleteObject(memBitmap);
@@ -272,81 +321,125 @@ static void Render(HWND hwnd, HDC hdc) {
 void UpdateControlVisibility() {
     if (g_appData.currentTab == 0) {
         ShowWindow(g_hEditInput, SW_SHOW);
-        ShowWindow(g_hBtnAdd, SW_SHOW);
         ShowWindow(g_hEditMemo, SW_HIDE);
     } else {
         ShowWindow(g_hEditInput, SW_HIDE);
-        ShowWindow(g_hBtnAdd, SW_HIDE);
         ShowWindow(g_hEditMemo, SW_SHOW);
     }
 }
 
-// 控件布局调整
+// 控件布局适配
 void LayoutControls(int width, int height) {
-    int inputY = HEADER_HEIGHT + TAB_HEIGHT + PROGRESS_HEIGHT + 8;
-    int btnW = 54;
-    int inputW = width - PADDING * 2 - btnW - 8;
-    MoveWindow(g_hEditInput, PADDING, inputY, inputW, 28, TRUE);
-    MoveWindow(g_hBtnAdd, PADDING + inputW + 8, inputY, btnW, 28, TRUE);
+    // 单行添加输入框嵌入圆角卡片内部
+    int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 8 + PROGRESS_AREA_HEIGHT + 8;
+    MoveWindow(g_hEditInput, PADDING + 12, inputCardY + 6, width - PADDING * 2 - 24, 24, TRUE);
 
+    // 多行笔记文本域
     int memoY = HEADER_HEIGHT + TAB_HEIGHT + 8;
-    int memoHeight = height - memoY - PADDING;
-    MoveWindow(g_hEditMemo, PADDING, memoY, width - PADDING * 2, memoHeight, TRUE);
+    int memoH = height - memoY - PADDING;
+    MoveWindow(g_hEditMemo, PADDING, memoY, width - PADDING * 2, memoH, TRUE);
 }
 
-// 延时防抖落盘数据
+// 延时防抖落盘
 void SaveDataDeferred(HWND hwnd) {
     SetTimer(hwnd, ID_TIMER_SAVE, 300, NULL);
+}
+
+// 输入框子类化过程（专门拦截 Enter 键添加待办，避免 Windows Edit 控件哔声并防止退出）
+LRESULT CALLBACK EditInputSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) {
+        // 读取输入文本
+        int len = GetWindowTextLengthW(hwnd);
+        if (len > 0) {
+            std::vector<wchar_t> buf(len + 1);
+            GetWindowTextW(hwnd, buf.data(), len + 1);
+            std::wstring text = buf.data();
+            if (!text.empty()) {
+                TodoItem item;
+                item.id = (long long)GetTickCount64();
+                item.text = text;
+                item.completed = false;
+                g_appData.todos.push_back(item);
+                SetWindowTextW(hwnd, L"");
+                InvalidateRect(g_hMainWnd, NULL, FALSE);
+                SaveDataDeferred(g_hMainWnd);
+            }
+        }
+        return 0; // 彻底吞掉回车，避免默认控件 beep 或退出
+    }
+    return CallWindowProcW(g_oldEditInputProc, hwnd, uMsg, wParam, lParam);
 }
 
 // 主窗口 WndProc
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
-        // 创建字体
-        g_hFontNormal = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        // 创建 Fluent 字体
+        g_hFontTitle = CreateFontW(17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+        if (!g_hFontTitle) {
+            g_hFontTitle = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        }
 
-        g_hFontBold = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        g_hFontNormal = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
 
-        g_hFontStrike = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, TRUE,
+        g_hFontStrike = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, TRUE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
 
         g_hFontSmall = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
 
-        // 待办添加单行输入框
+        // 待办单行输入框（平坦无边框，嵌入卡片背景）
         g_hEditInput = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", L"",
+            0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_INPUT, g_hInstance, NULL
         );
         SendMessage(g_hEditInput, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hEditInput, EM_SETCUEBANNER, TRUE, (LPARAM)L"输入待办后按回车直接添加...");
+        // 子类化输入框
+        g_oldEditInputProc = (WNDPROC)SetWindowLongPtrW(g_hEditInput, GWLP_WNDPROC, (LONG_PTR)EditInputSubclassProc);
 
-        // 添加按钮
-        g_hBtnAdd = CreateWindowExW(
-            0, L"BUTTON", L"添加",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, (HMENU)ID_BTN_ADD, g_hInstance, NULL
-        );
-        SendMessage(g_hBtnAdd, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-
-        // 自由速记多行文本框
+        // 自由速记多行文本域
         g_hEditMemo = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", g_appData.memoText.c_str(),
+            0, L"EDIT", g_appData.memoText.c_str(),
             WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_MEMO, g_hInstance, NULL
         );
         SendMessage(g_hEditMemo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
         UpdateControlVisibility();
-        TrayManager::AddTrayIcon(hwnd);
+        TrayManager::AddTrayIcon(hwnd, g_appData.colorTheme);
         return 0;
+    }
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HWND hCtl = (HWND)lParam;
+        ColorScheme colors = GetThemeColors(g_appData.colorTheme);
+        HDC hdcCtl = (HDC)wParam;
+        SetTextColor(hdcCtl, colors.textPrimary);
+        if (hCtl == g_hEditInput) {
+            SetBkColor(hdcCtl, colors.cardBg);
+            static HBRUSH hBrushCard = NULL;
+            if (hBrushCard) DeleteObject(hBrushCard);
+            hBrushCard = CreateSolidBrush(colors.cardBg);
+            return (LRESULT)hBrushCard;
+        } else if (hCtl == g_hEditMemo) {
+            SetBkColor(hdcCtl, colors.bodyBg);
+            static HBRUSH hBrushBody = NULL;
+            if (hBrushBody) DeleteObject(hBrushBody);
+            hBrushBody = CreateSolidBrush(colors.bodyBg);
+            return (LRESULT)hBrushBody;
+        }
+        break;
     }
 
     case WM_SIZE: {
@@ -372,7 +465,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER: {
         if (wParam == ID_TIMER_SAVE) {
             KillTimer(hwnd, ID_TIMER_SAVE);
-            // 同步 Memo 文本
             int memoLen = GetWindowTextLengthW(g_hEditMemo);
             std::vector<wchar_t> memoBuf(memoLen + 1);
             GetWindowTextW(g_hEditMemo, memoBuf.data(), memoLen + 1);
@@ -386,40 +478,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
 
-        if (id == ID_BTN_ADD && code == BN_CLICKED) {
-            int len = GetWindowTextLengthW(g_hEditInput);
-            if (len > 0) {
-                std::vector<wchar_t> buf(len + 1);
-                GetWindowTextW(g_hEditInput, buf.data(), len + 1);
-                std::wstring text = buf.data();
-                if (!text.empty()) {
-                    TodoItem item;
-                    item.id = (int)GetTickCount64();
-                    item.text = text;
-                    item.completed = false;
-                    g_appData.todos.push_back(item);
-                    SetWindowTextW(g_hEditInput, L"");
-                    InvalidateRect(hwnd, NULL, FALSE);
-                    SaveDataDeferred(hwnd);
-                }
-            }
-            SetFocus(g_hEditInput);
-            return 0;
-        }
-
         if (id == ID_EDIT_MEMO && code == EN_CHANGE) {
             SaveDataDeferred(hwnd);
             return 0;
         }
 
-        // 托盘菜单响应
-        if (id == ID_TRAY_TOGGLE) {
-            if (IsWindowVisible(hwnd)) {
-                ShowWindow(hwnd, SW_HIDE);
-            } else {
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
-            }
+        // 托盘菜单处理
+        if (id == ID_TRAY_SHOW) {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            return 0;
+        }
+
+        if (id == ID_TRAY_HIDE) {
+            ShowWindow(hwnd, SW_HIDE);
             return 0;
         }
 
@@ -432,13 +504,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
-        if (id == ID_TRAY_NEW_TODO) {
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-            g_appData.currentTab = 0;
-            UpdateControlVisibility();
-            SetFocus(g_hEditInput);
-            InvalidateRect(hwnd, NULL, FALSE);
+        if (id >= ID_TRAY_COLOR_BASE && id <= ID_TRAY_COLOR_BASE + 5) {
+            g_appData.colorTheme = id - ID_TRAY_COLOR_BASE;
+            TrayManager::UpdateTrayIcon(hwnd, g_appData.colorTheme);
+            InvalidateRect(hwnd, NULL, TRUE);
+            SaveDataDeferred(hwnd);
             return 0;
         }
 
@@ -458,17 +528,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 SetForegroundWindow(hwnd);
             }
         } else if (lParam == WM_RBUTTONUP) {
-            TrayManager::ShowContextMenu(hwnd, g_appData.isAlwaysOnTop);
+            TrayManager::ShowContextMenu(hwnd, g_appData.isAlwaysOnTop, g_appData.colorTheme);
         }
         return 0;
     }
 
     case WM_NCHITTEST: {
-        // 自定义边框调整大小（8方向自由缩放）与无边框风格兼顾
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc;
         GetWindowRect(hwnd, &rc);
-        int border = 6;
+        int border = 8;
         bool left = pt.x >= rc.left && pt.x < rc.left + border;
         bool right = pt.x < rc.right && pt.x >= rc.right - border;
         bool top = pt.y >= rc.top && pt.y < rc.top + border;
@@ -493,10 +562,13 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         GetClientRect(hwnd, &rc);
         int width = rc.right - rc.left;
 
-        // 1. 顶部 Header 拖拽与按钮响应
+        // 1. 顶部 Header
         if (y < HEADER_HEIGHT) {
-            // 置顶按钮区
-            if (x >= width - 66 && x < width - 36) {
+            int btnY = (HEADER_HEIGHT - 26) / 2;
+            int btnH = 26;
+
+            // 置顶
+            if (x >= width - 100 && x < width - 70 && y >= btnY && y <= btnY + btnH) {
                 g_appData.isAlwaysOnTop = !g_appData.isAlwaysOnTop;
                 SetWindowPos(hwnd, g_appData.isAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                              0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -504,18 +576,27 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 SaveDataDeferred(hwnd);
                 return 0;
             }
-            // 最小化到托盘
-            if (x >= width - 36 && x <= width - 8) {
+            // 切换主题色 (循环切换)
+            if (x >= width - 66 && x < width - 38 && y >= btnY && y <= btnY + btnH) {
+                g_appData.colorTheme = (g_appData.colorTheme + 1) % 6;
+                TrayManager::UpdateTrayIcon(hwnd, g_appData.colorTheme);
+                InvalidateRect(hwnd, NULL, TRUE);
+                SaveDataDeferred(hwnd);
+                return 0;
+            }
+            // 隐藏/最小化到托盘
+            if (x >= width - 34 && x <= width - 8 && y >= btnY && y <= btnY + btnH) {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
-            // 移动窗口
+
+            // 拖动窗口
             ReleaseCapture();
             SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
             return 0;
         }
 
-        // 2. Tab 切换区
+        // 2. Tab 切换
         if (y >= HEADER_HEIGHT && y < HEADER_HEIGHT + TAB_HEIGHT) {
             int newTab = (x < width / 2) ? 0 : 1;
             if (newTab != g_appData.currentTab) {
@@ -527,20 +608,21 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
-        // 3. Tab 0 列表项点击（勾选完成 / 删除项）
+        // 3. Tab 0 待办事项交互
         if (g_appData.currentTab == 0) {
-            int listStartY = HEADER_HEIGHT + TAB_HEIGHT + PROGRESS_HEIGHT + INPUT_AREA_HEIGHT + 8;
+            int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 8 + PROGRESS_AREA_HEIGHT + 8;
+            int listStartY = inputCardY + 36 + 10;
             if (y >= listStartY) {
                 int clickedIdx = (y - listStartY + g_scrollOffset) / ITEM_HEIGHT;
                 if (clickedIdx >= 0 && clickedIdx < (int)g_appData.todos.size()) {
-                    // 判断是否点击了删除按钮
-                    if (x >= width - PADDING - 26 && x <= width - PADDING - 4) {
+                    // 删除
+                    if (x >= width - PADDING - 30 && x <= width - PADDING - 8) {
                         g_appData.todos.erase(g_appData.todos.begin() + clickedIdx);
                         InvalidateRect(hwnd, NULL, FALSE);
                         SaveDataDeferred(hwnd);
                         return 0;
                     }
-                    // 点击复选框或文字切换完成状态
+                    // 完成状态切换
                     g_appData.todos[clickedIdx].completed = !g_appData.todos[clickedIdx].completed;
                     InvalidateRect(hwnd, NULL, FALSE);
                     SaveDataDeferred(hwnd);
@@ -558,14 +640,27 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         GetClientRect(hwnd, &rc);
         int width = rc.right - rc.left;
 
-        // 追踪鼠标离开窗口
         TRACKMOUSEEVENT tme = { sizeof(tme) };
         tme.dwFlags = TME_LEAVE;
         tme.hwndTrack = hwnd;
         TrackMouseEvent(&tme);
 
+        // Header 按钮悬浮检查
+        int prevHeaderBtn = g_hoveredHeaderBtn;
+        g_hoveredHeaderBtn = 0;
+        if (y < HEADER_HEIGHT) {
+            int btnY = (HEADER_HEIGHT - 26) / 2;
+            int btnH = 26;
+            if (y >= btnY && y <= btnY + btnH) {
+                if (x >= width - 100 && x < width - 70) g_hoveredHeaderBtn = 1;
+                else if (x >= width - 66 && x < width - 38) g_hoveredHeaderBtn = 2;
+                else if (x >= width - 34 && x <= width - 8) g_hoveredHeaderBtn = 3;
+            }
+        }
+
         if (g_appData.currentTab == 0) {
-            int listStartY = HEADER_HEIGHT + TAB_HEIGHT + PROGRESS_HEIGHT + INPUT_AREA_HEIGHT + 8;
+            int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 8 + PROGRESS_AREA_HEIGHT + 8;
+            int listStartY = inputCardY + 36 + 10;
             int prevHovered = g_hoveredItemIdx;
             int prevDel = g_hoveredDeleteIdx;
 
@@ -573,7 +668,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 int hoverIdx = (y - listStartY + g_scrollOffset) / ITEM_HEIGHT;
                 if (hoverIdx >= 0 && hoverIdx < (int)g_appData.todos.size()) {
                     g_hoveredItemIdx = hoverIdx;
-                    if (x >= width - PADDING - 26 && x <= width - PADDING - 4) {
+                    if (x >= width - PADDING - 30 && x <= width - PADDING - 8) {
                         g_hoveredDeleteIdx = hoverIdx;
                     } else {
                         g_hoveredDeleteIdx = -1;
@@ -587,7 +682,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_hoveredDeleteIdx = -1;
             }
 
-            if (prevHovered != g_hoveredItemIdx || prevDel != g_hoveredDeleteIdx) {
+            if (prevHovered != g_hoveredItemIdx || prevDel != g_hoveredDeleteIdx || prevHeaderBtn != g_hoveredHeaderBtn) {
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        } else {
+            if (prevHeaderBtn != g_hoveredHeaderBtn) {
                 InvalidateRect(hwnd, NULL, FALSE);
             }
         }
@@ -597,6 +696,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     case WM_MOUSELEAVE: {
         g_hoveredItemIdx = -1;
         g_hoveredDeleteIdx = -1;
+        g_hoveredHeaderBtn = 0;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
@@ -621,8 +721,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY: {
         TrayManager::RemoveTrayIcon(hwnd);
+        if (g_hFontTitle) DeleteObject(g_hFontTitle);
         if (g_hFontNormal) DeleteObject(g_hFontNormal);
-        if (g_hFontBold) DeleteObject(g_hFontBold);
         if (g_hFontStrike) DeleteObject(g_hFontStrike);
         if (g_hFontSmall) DeleteObject(g_hFontSmall);
         PostQuitMessage(0);
@@ -641,8 +741,8 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     g_hInstance = hInstance;
 
-    // 单实例检查（防止多次打开多开图标冲突）
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyStickyNotes_SingleInstance_Mutex");
+    // 单实例检查（若已运行则直接唤醒并置顶）
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyStickyNotes_SingleInstance_Mutex_v2");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existingWnd = FindWindowW(L"MyStickyNotes_Main", NULL);
         if (existingWnd) {
@@ -652,16 +752,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
-    // 初始化通用控件
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icex.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icex);
 
-    // 加载已保存的数据
     DataStore::Load(g_appData);
 
-    // 1. 注册不可见的 Owner 窗口类（任务栏隐藏的关键底层机制）
+    // 1. 注册不可见的 Owner 窗口类
     WNDCLASSEXW owc = { sizeof(owc) };
     owc.lpfnWndProc = OwnerWndProc;
     owc.hInstance = hInstance;
@@ -674,16 +772,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         NULL, NULL, hInstance, NULL
     );
 
-    // 2. 注册主便签窗口类
+    // 2. 注册主便笺窗口类
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"MyStickyNotes_Main";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = NULL;
     RegisterClassExW(&wc);
 
-    // 使用 WS_EX_TOOLWINDOW 与 Owner 机制，彻底规避 Windows 任务栏图标
     DWORD exStyle = WS_EX_TOOLWINDOW;
     if (g_appData.isAlwaysOnTop) {
         exStyle |= WS_EX_TOPMOST;
@@ -692,27 +789,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     g_hMainWnd = CreateWindowExW(
         exStyle,
         L"MyStickyNotes_Main",
-        L"My Sticky Notes",
+        L"Sticky Notes",
         WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         g_appData.windowX, g_appData.windowY,
         g_appData.windowWidth, g_appData.windowHeight,
-        g_hOwnerWnd, // 关键：Owner 指向隐藏窗口
+        g_hOwnerWnd,
         NULL, hInstance, NULL
     );
 
     if (!g_hMainWnd) return 0;
 
+    // 启用现代 Win11 圆角和微柔和投影
+    DWM_WINDOW_CORNER_PREFERENCE pref = DWMWCP_ROUND;
+    DwmSetWindowAttribute(g_hMainWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+    MARGINS margins = { 1, 1, 1, 1 };
+    DwmExtendFrameIntoClientArea(g_hMainWnd, &margins);
+
     ShowWindow(g_hMainWnd, SW_SHOW);
     UpdateWindow(g_hMainWnd);
 
-    // 消息循环
+    // 标准消息循环（输入框回车由子类化 EditInputSubclassProc 完全自主处理）
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        // 回车快捷添加待办
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && msg.hwnd == g_hEditInput) {
-            SendMessage(g_hMainWnd, WM_COMMAND, MAKEWPARAM(ID_BTN_ADD, BN_CLICKED), (LPARAM)g_hBtnAdd);
-            continue;
-        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
