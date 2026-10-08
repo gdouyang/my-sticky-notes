@@ -26,7 +26,7 @@ struct AppData {
     bool isAlwaysOnTop = false;
     int colorTheme = COLOR_YELLOW; // 主题色彩
     int currentTab = 0; // 0: 待办清单, 1: 随手速记
-    std::wstring memoText;
+    std::string memoRtf; // 富文本 RTF 内容 (格式与排版持久化)
     std::vector<TodoItem> todos;
 };
 

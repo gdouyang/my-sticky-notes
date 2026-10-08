@@ -123,7 +123,7 @@ bool DataStore::Load(AppData& data) {
     data.isAlwaysOnTop = findBool("isAlwaysOnTop", false);
     data.colorTheme = findInt("colorTheme", COLOR_YELLOW);
     data.currentTab = findInt("currentTab", 0);
-    data.memoText = Utf8ToWide(findString("memoText"));
+    data.memoRtf = findString("memoRtf");
 
     // 解析 todos 数组
     data.todos.clear();
@@ -188,7 +188,7 @@ bool DataStore::Save(const AppData& data) {
     file << "  \"isAlwaysOnTop\": " << (data.isAlwaysOnTop ? "true" : "false") << ",\n";
     file << "  \"colorTheme\": " << data.colorTheme << ",\n";
     file << "  \"currentTab\": " << data.currentTab << ",\n";
-    file << "  \"memoText\": \"" << EscapeJsonString(WideToUtf8(data.memoText)) << "\",\n";
+    file << "  \"memoRtf\": \"" << EscapeJsonString(data.memoRtf) << "\",\n";
     file << "  \"todos\": [\n";
 
     for (size_t i = 0; i < data.todos.size(); ++i) {
