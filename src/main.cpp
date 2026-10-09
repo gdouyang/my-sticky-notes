@@ -91,7 +91,7 @@ LRESULT CALLBACK TooltipWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK EditInputSubclassProc(HWND, UINT, WPARAM, LPARAM);
 void SaveDataDeferred(HWND hwnd);
 void UpdateControlVisibility();
-void LayoutControls(int width, int height);
+void LayoutControls(HWND hwnd, int width, int height);
 void UpdateFontsForDpi(UINT dpi);
 void ShowTooltip(HWND hParent, const std::wstring& text, RECT targetRect, bool above, UINT dpi);
 void HideTooltip();
@@ -346,23 +346,29 @@ void UpdateControlVisibility() {
 }
 
 // 控件布局适配
-void LayoutControls(int width, int height) {
-    UINT dpi = GetWindowDpi(g_hMainWnd);
+void LayoutControls(HWND hwnd, int width, int height) {
+    if (!hwnd) return;
+    UINT dpi = GetWindowDpi(hwnd);
     LayoutMetrics m = GetMetrics(dpi);
     int progY = m.headerH + m.tabH + ScaleDpi(10, dpi);
     int inputCardY = progY + m.progressH + ScaleDpi(8, dpi);
     int editPad = ScaleDpi(12, dpi);
     int editH = ScaleDpi(22, dpi);
     int editY = inputCardY + (m.inputCardH - editH) / 2;
-    MoveWindow(g_hEditInput, m.padding + editPad, editY, width - (m.padding + editPad) * 2, editH, TRUE);
+    if (g_hEditInput) {
+        MoveWindow(g_hEditInput, m.padding + editPad, editY, width - (m.padding + editPad) * 2, editH, TRUE);
+    }
 
     // 富文本 RichEdit (留出顶部 Tab 和底部格式栏的高度)
     int memoY = m.headerH + m.tabH + ScaleDpi(6, dpi);
+    int memoW = width - m.padding * 2;
     int memoH = height - memoY - m.formatBarH - ScaleDpi(6, dpi);
-    MoveWindow(g_hRichMemo, m.padding, memoY, width - m.padding * 2, memoH, TRUE);
-
-    RECT marginsRc = { ScaleDpi(4, dpi), ScaleDpi(4, dpi), ScaleDpi(4, dpi), ScaleDpi(4, dpi) };
-    SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&marginsRc);
+    if (g_hRichMemo) {
+        MoveWindow(g_hRichMemo, m.padding, memoY, memoW, memoH, TRUE);
+        int margin = ScaleDpi(4, dpi);
+        RECT formatRc = { margin, margin, memoW - margin, memoH - margin };
+        SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&formatRc);
+    }
 }
 
 // 延时防抖落盘
@@ -423,6 +429,7 @@ static void Render(HWND hwnd, HDC hdc) {
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
+        g_hMainWnd = hwnd;
         UINT dpi = GetWindowDpi(hwnd);
         UpdateFontsForDpi(dpi);
 
@@ -445,17 +452,17 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         // 启用高级事件监听与平滑排版
         SendMessage(g_hRichMemo, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
-        SendMessage(g_hRichMemo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-
-        int margin = ScaleDpi(4, dpi);
-        RECT marginsRc = { margin, margin, margin, margin };
-        SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&marginsRc);
 
         // 加载 RTF 格式
         LoadRichTextToControl(g_hRichMemo, g_appData.memoRtf);
 
         // 统一应用主题色（背景色与富文本文字前景色）
         ApplyThemeToControls(g_appData.colorTheme);
+
+        // 按当前屏幕真实尺寸与 DPI 进行首次控件排版
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        LayoutControls(hwnd, rc.right - rc.left, rc.bottom - rc.top);
 
         UpdateControlVisibility();
         TrayManager::AddTrayIcon(hwnd, g_appData.colorTheme);
@@ -473,7 +480,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         UpdateFontsForDpi(newDpi);
         RECT rc;
         GetClientRect(hwnd, &rc);
-        LayoutControls(rc.right - rc.left, rc.bottom - rc.top);
+        LayoutControls(hwnd, rc.right - rc.left, rc.bottom - rc.top);
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
@@ -500,7 +507,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         int height = HIWORD(lParam);
         g_appData.windowWidth = width;
         g_appData.windowHeight = height;
-        LayoutControls(width, height);
+        LayoutControls(hwnd, width, height);
         InvalidateRect(hwnd, NULL, FALSE);
         SaveDataDeferred(hwnd);
         return 0;
@@ -1140,6 +1147,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     ShowWindow(g_hMainWnd, SW_SHOW);
     UpdateWindow(g_hMainWnd);
+
+    // 确保主窗口显示后按当前所在屏幕的精确真实 DPI 进行最终对齐
+    RECT rcInit;
+    GetClientRect(g_hMainWnd, &rcInit);
+    UpdateFontsForDpi(GetWindowDpi(g_hMainWnd));
+    LayoutControls(g_hMainWnd, rcInit.right - rcInit.left, rcInit.bottom - rcInit.top);
 
     // 若开启置顶，初始化检测边缘贴边状态
     if (g_appData.isAlwaysOnTop) {
