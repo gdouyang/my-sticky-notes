@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -16,17 +17,35 @@
 #define ID_RICH_MEMO        1003
 #define ID_TIMER_SAVE       1004
 
-// 格式工具栏按钮 ID
+// 格式工具栏按钮 ID (参考微软便签: 粗体、斜体、下划线、删除线、列表、图片)
 #define ID_BTN_BOLD         1101
 #define ID_BTN_ITALIC       1102
 #define ID_BTN_UNDERLINE    1103
 #define ID_BTN_STRIKE       1104
 #define ID_BTN_BULLET       1105
+#define ID_BTN_IMAGE        1106
+#define NUM_FMT_BTNS        6
+
+static const wchar_t* FMT_BTN_TITLES[] = {
+    L"加粗",
+    L"斜体",
+    L"下划线",
+    L"删除线",
+    L"切换项目符号",
+    L"添加图像"
+};
+
+static const wchar_t* HEADER_BTN_TITLES[] = {
+    L"置顶窗口",
+    L"切换便签颜色",
+    L"最小化到托盘"
+};
 
 // 全局变量
 static HINSTANCE g_hInstance = NULL;
 static HWND g_hOwnerWnd = NULL;
 static HWND g_hMainWnd = NULL;
+static HWND g_hTooltipWnd = NULL;
 static HWND g_hEditInput = NULL;
 static HWND g_hRichMemo = NULL;
 static WNDPROC g_oldEditInputProc = NULL;
@@ -36,23 +55,71 @@ static HFONT g_hFontTitle = NULL;
 static HFONT g_hFontNormal = NULL;
 static HFONT g_hFontStrike = NULL;
 static HFONT g_hFontSmall = NULL;
-static HFONT g_hFontFmt = NULL;
+static HFONT g_hFontFmtB = NULL;
+static HFONT g_hFontFmtI = NULL;
+static HFONT g_hFontFmtU = NULL;
+static HFONT g_hFontFmtAB = NULL;
+
+static std::wstring g_tooltipText = L"";
 
 static AppData g_appData;
 static int g_scrollOffset = 0;
 static int g_hoveredItemIdx = -1;
 static int g_hoveredDeleteIdx = -1;
 static int g_hoveredHeaderBtn = 0; // 1: Pin, 2: Theme, 3: Close/Min
-static int g_hoveredFmtBtn = 0;    // 1: B, 2: I, 3: U, 4: S, 5: Bullet
+static int g_hoveredFmtBtn = 0;    // 1..6
 
-// 布局常量
-static const int HEADER_HEIGHT = 44;
-static const int TAB_HEIGHT = 38;
-static const int PROGRESS_AREA_HEIGHT = 48;
-static const int INPUT_AREA_HEIGHT = 44;
-static const int ITEM_HEIGHT = 42;
-static const int FORMAT_BAR_HEIGHT = 36;
-static const int PADDING = 14;
+// DPI 与缩放计算辅助
+inline UINT GetWindowDpi(HWND hwnd) {
+    typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+    static PFN_GetDpiForWindow pfn = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    if (pfn && hwnd) {
+        UINT dpi = pfn(hwnd);
+        if (dpi > 0) return dpi;
+    }
+    HDC hdc = GetDC(hwnd);
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+    ReleaseDC(hwnd, hdc);
+    return (dpi > 0) ? (UINT)dpi : 96;
+}
+
+inline int ScaleDpi(int value, UINT dpi) {
+    return MulDiv(value, (int)dpi, 96);
+}
+
+struct LayoutMetrics {
+    UINT dpi;
+    int headerH;
+    int tabH;
+    int progressH;
+    int inputCardH;
+    int itemH;
+    int formatBarH;
+    int padding;
+    int headerBtnW;
+    int headerBtnH;
+    int fmtBtnW;
+    int fmtBtnH;
+    int fmtBtnPad;
+};
+
+inline LayoutMetrics GetMetrics(UINT dpi) {
+    LayoutMetrics m;
+    m.dpi = dpi;
+    m.headerH = ScaleDpi(44, dpi);
+    m.tabH = ScaleDpi(38, dpi);
+    m.progressH = ScaleDpi(48, dpi);
+    m.inputCardH = ScaleDpi(36, dpi);
+    m.itemH = ScaleDpi(42, dpi);
+    m.formatBarH = ScaleDpi(40, dpi);
+    m.padding = ScaleDpi(14, dpi);
+    m.headerBtnW = ScaleDpi(28, dpi);
+    m.headerBtnH = ScaleDpi(28, dpi);
+    m.fmtBtnW = ScaleDpi(34, dpi);
+    m.fmtBtnH = ScaleDpi(30, dpi);
+    m.fmtBtnPad = ScaleDpi(4, dpi);
+    return m;
+}
 
 // 函数声明
 LRESULT CALLBACK OwnerWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -65,6 +132,7 @@ void ApplyFormatToSelection(HWND hRich, DWORD mask, DWORD effect);
 void ToggleBullet(HWND hRich);
 void SyncRichTextSave(HWND hwnd);
 void LoadRichTextToControl(HWND hRich, const std::string& rtf);
+void UpdateFontsForDpi(UINT dpi);
 
 // RTF 流入流出回调结构体
 struct RtfStreamInCookie {
@@ -145,6 +213,197 @@ void ToggleBullet(HWND hRich) {
     SaveDataDeferred(g_hMainWnd);
 }
 
+// 按钮几何尺寸辅助计算
+inline RECT GetFormatBtnRect(int width, int height, int index, UINT dpi) {
+    LayoutMetrics m = GetMetrics(dpi);
+    int btnY = height - m.formatBarH + (m.formatBarH - m.fmtBtnH) / 2;
+    int x = m.padding + (index - 1) * (m.fmtBtnW + m.fmtBtnPad);
+    return { x, btnY, x + m.fmtBtnW, btnY + m.fmtBtnH };
+}
+
+inline RECT GetHeaderBtnRect(int width, int index, UINT dpi) {
+    LayoutMetrics m = GetMetrics(dpi);
+    int btnY = (m.headerH - m.headerBtnH) / 2;
+    int x3 = width - ScaleDpi(34, dpi);
+    int x2 = width - ScaleDpi(68, dpi);
+    int x1 = width - ScaleDpi(102, dpi);
+    if (index == 1) return { x1, btnY, x1 + m.headerBtnW, btnY + m.headerBtnH };
+    if (index == 2) return { x2, btnY, x2 + m.headerBtnW, btnY + m.headerBtnH };
+    if (index == 3) return { x3, btnY, x3 + m.headerBtnW, btnY + m.headerBtnH };
+    return { 0, 0, 0, 0 };
+}
+
+// 悬浮提示 Tooltip 窗口过程
+LRESULT CALLBACK TooltipWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT; // 鼠标事件直接穿透，不阻断下方点击
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+        // 柔和白底与现代淡灰精致边框 (与 Windows 现代 Tooltip 设计语言一致)
+        HBRUSH bgBrush = CreateSolidBrush(RGB(255, 255, 255));
+        FillRect(memDC, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(210, 210, 210));
+        HGDIOBJ oldPen = SelectObject(memDC, borderPen);
+        HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(memDC, 0, 0, rc.right, rc.bottom);
+        SelectObject(memDC, oldBrush);
+        SelectObject(memDC, oldPen);
+        DeleteObject(borderPen);
+
+        SetBkMode(memDC, TRANSPARENT);
+        SetTextColor(memDC, RGB(25, 25, 25));
+        SelectObject(memDC, g_hFontSmall ? g_hFontSmall : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(memDC, g_tooltipText.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+void ShowTooltip(HWND hParent, const std::wstring& text, RECT targetRect, bool above, UINT dpi) {
+    if (!g_hTooltipWnd) return;
+    g_tooltipText = text;
+
+    HDC hdc = GetDC(g_hTooltipWnd);
+    SelectObject(hdc, g_hFontSmall ? g_hFontSmall : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    SIZE sz = { 0, 0 };
+    GetTextExtentPoint32W(hdc, text.c_str(), (int)text.length(), &sz);
+    ReleaseDC(g_hTooltipWnd, hdc);
+
+    int tipW = sz.cx + ScaleDpi(18, dpi);
+    int tipH = sz.cy + ScaleDpi(10, dpi);
+    int minTipH = ScaleDpi(24, dpi);
+    if (tipH < minTipH) tipH = minTipH;
+
+    POINT ptTarget = { (targetRect.left + targetRect.right) / 2, above ? targetRect.top : targetRect.bottom };
+    ClientToScreen(hParent, &ptTarget);
+
+    int gap = ScaleDpi(5, dpi);
+    int tipX = ptTarget.x - tipW / 2;
+    int tipY = above ? (ptTarget.y - tipH - gap) : (ptTarget.y + gap);
+
+    SetWindowPos(g_hTooltipWnd, HWND_TOPMOST, tipX, tipY, tipW, tipH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_hTooltipWnd, NULL, TRUE);
+}
+
+void HideTooltip() {
+    if (g_hTooltipWnd && IsWindowVisible(g_hTooltipWnd)) {
+        ShowWindow(g_hTooltipWnd, SW_HIDE);
+    }
+}
+
+// 动态根据当前 DPI 生成超高清晰度的矢量字体与控件字体
+void UpdateFontsForDpi(UINT dpi) {
+    if (g_hFontTitle) DeleteObject(g_hFontTitle);
+    if (g_hFontNormal) DeleteObject(g_hFontNormal);
+    if (g_hFontStrike) DeleteObject(g_hFontStrike);
+    if (g_hFontSmall) DeleteObject(g_hFontSmall);
+    if (g_hFontFmtB) DeleteObject(g_hFontFmtB);
+    if (g_hFontFmtI) DeleteObject(g_hFontFmtI);
+    if (g_hFontFmtU) DeleteObject(g_hFontFmtU);
+    if (g_hFontFmtAB) DeleteObject(g_hFontFmtAB);
+
+    int titleH = ScaleDpi(17, dpi);
+    int normalH = ScaleDpi(16, dpi);
+    int smallH = ScaleDpi(13, dpi);
+    int fmtBH = ScaleDpi(17, dpi);
+    int fmtIH = ScaleDpi(18, dpi);
+    int fmtUH = ScaleDpi(16, dpi);
+    int fmtABH = ScaleDpi(16, dpi);
+
+    g_hFontTitle = CreateFontW(-titleH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+    g_hFontNormal = CreateFontW(-normalH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+    g_hFontStrike = CreateFontW(-normalH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, TRUE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+    g_hFontSmall = CreateFontW(-smallH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+
+    g_hFontFmtB = CreateFontW(-fmtBH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    g_hFontFmtI = CreateFontW(-fmtIH, 0, 0, 0, FW_NORMAL, TRUE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Georgia");
+
+    g_hFontFmtU = CreateFontW(-fmtUH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    g_hFontFmtAB = CreateFontW(-fmtABH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    if (g_hEditInput) {
+        SendMessage(g_hEditInput, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    }
+    if (g_hRichMemo) {
+        SendMessage(g_hRichMemo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    }
+}
+
+// 插入图片到富文本笔记
+void InsertImageFromFile(HWND hwnd, HWND hRich) {
+    wchar_t szFile[MAX_PATH] = { 0 };
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = L"图像文件 (*.png;*.jpg;*.jpeg;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn)) {
+        Gdiplus::Bitmap bmp(szFile);
+        if (bmp.GetLastStatus() == Gdiplus::Ok) {
+            HBITMAP hBmp = NULL;
+            Gdiplus::Color bg(255, 255, 255);
+            bmp.GetHBITMAP(bg, &hBmp);
+            if (hBmp) {
+                if (OpenClipboard(hwnd)) {
+                    EmptyClipboard();
+                    if (!SetClipboardData(CF_BITMAP, hBmp)) {
+                        DeleteObject(hBmp);
+                    }
+                    CloseClipboard();
+                    SendMessage(hRich, WM_PASTE, 0, 0);
+                } else {
+                    DeleteObject(hBmp);
+                }
+            }
+            SetFocus(hRich);
+            SaveDataDeferred(hwnd);
+        }
+    }
+}
+
 // 统计进度
 static void GetTodoStats(int& completed, int& total, float& percent) {
     total = (int)g_appData.todos.size();
@@ -177,6 +436,8 @@ static void Render(HWND hwnd, HDC hdc) {
     int width = clientRc.right - clientRc.left;
     int height = clientRc.bottom - clientRc.top;
 
+    UINT dpi = GetWindowDpi(hwnd);
+    LayoutMetrics m = GetMetrics(dpi);
     ColorScheme colors = GetThemeColors(g_appData.colorTheme);
 
     HDC memDC = CreateCompatibleDC(hdc);
@@ -189,7 +450,7 @@ static void Render(HWND hwnd, HDC hdc) {
     DeleteObject(bodyBrush);
 
     // 2. 顶部 Fluent Header
-    RECT headerRc = { 0, 0, width, HEADER_HEIGHT };
+    RECT headerRc = { 0, 0, width, m.headerH };
     HBRUSH headerBrush = CreateSolidBrush(colors.headerBg);
     FillRect(memDC, &headerRc, headerBrush);
     DeleteObject(headerBrush);
@@ -198,17 +459,16 @@ static void Render(HWND hwnd, HDC hdc) {
     SetBkMode(memDC, TRANSPARENT);
     SelectObject(memDC, g_hFontTitle);
     SetTextColor(memDC, colors.textPrimary);
-    RECT titleRc = { PADDING, 0, width - 120, HEADER_HEIGHT };
+    RECT titleRc = { m.padding, 0, width - ScaleDpi(120, dpi), m.headerH };
     DrawTextW(memDC, L"便笺与进度", -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
     // 顶部按钮区: [📌 置顶] [🎨 换色] [× 隐藏]
-    int btnY = (HEADER_HEIGHT - 28) / 2;
-    int btnH = 28;
+    int btnRadius = ScaleDpi(6, dpi);
 
     // 置顶
-    RECT pinBtnRc = { width - 102, btnY, width - 72, btnY + btnH };
+    RECT pinBtnRc = GetHeaderBtnRect(width, 1, dpi);
     if (g_hoveredHeaderBtn == 1 || g_appData.isAlwaysOnTop) {
-        DrawModernRoundRect(memDC, pinBtnRc, 6, g_appData.isAlwaysOnTop ? colors.accent : colors.hoverOverlay, colors.cardBorder);
+        DrawModernRoundRect(memDC, pinBtnRc, btnRadius, g_appData.isAlwaysOnTop ? colors.accent : colors.hoverOverlay, colors.cardBorder);
         SetTextColor(memDC, g_appData.isAlwaysOnTop ? RGB(255, 255, 255) : colors.textPrimary);
     } else {
         SetTextColor(memDC, colors.textSecondary);
@@ -217,17 +477,17 @@ static void Render(HWND hwnd, HDC hdc) {
     DrawTextW(memDC, L"📌", -1, &pinBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
     // 换色
-    RECT themeBtnRc = { width - 68, btnY, width - 38, btnY + btnH };
+    RECT themeBtnRc = GetHeaderBtnRect(width, 2, dpi);
     if (g_hoveredHeaderBtn == 2) {
-        DrawModernRoundRect(memDC, themeBtnRc, 6, colors.hoverOverlay, colors.cardBorder);
+        DrawModernRoundRect(memDC, themeBtnRc, btnRadius, colors.hoverOverlay, colors.cardBorder);
     }
     SetTextColor(memDC, colors.textSecondary);
     DrawTextW(memDC, L"🎨", -1, &themeBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
     // 隐藏
-    RECT closeBtnRc = { width - 34, btnY, width - 6, btnY + btnH };
+    RECT closeBtnRc = GetHeaderBtnRect(width, 3, dpi);
     if (g_hoveredHeaderBtn == 3) {
-        DrawModernRoundRect(memDC, closeBtnRc, 6, RGB(254, 226, 226), RGB(248, 113, 113));
+        DrawModernRoundRect(memDC, closeBtnRc, btnRadius, RGB(254, 226, 226), RGB(248, 113, 113));
         SetTextColor(memDC, RGB(220, 38, 38));
     } else {
         SetTextColor(memDC, colors.textSecondary);
@@ -235,14 +495,17 @@ static void Render(HWND hwnd, HDC hdc) {
     DrawTextW(memDC, L"×", -1, &closeBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
     // 3. Tab 栏
-    int tabY = HEADER_HEIGHT;
+    int tabY = m.headerH;
     int tabWidth = width / 2;
-    RECT tab1Rc = { 0, tabY, tabWidth, tabY + TAB_HEIGHT };
-    RECT tab2Rc = { tabWidth, tabY, width, tabY + TAB_HEIGHT };
+    RECT tab1Rc = { 0, tabY, tabWidth, tabY + m.tabH };
+    RECT tab2Rc = { tabWidth, tabY, width, tabY + m.tabH };
+
+    int indHalfW = ScaleDpi(34, dpi);
+    int indH = ScaleDpi(3, dpi);
 
     // Tab 1 (待办进度)
     if (g_appData.currentTab == 0) {
-        RECT indRc = { tabWidth / 2 - 34, tabY + TAB_HEIGHT - 3, tabWidth / 2 + 34, tabY + TAB_HEIGHT };
+        RECT indRc = { tabWidth / 2 - indHalfW, tabY + m.tabH - indH, tabWidth / 2 + indHalfW, tabY + m.tabH };
         HBRUSH indBrush = CreateSolidBrush(colors.accent);
         FillRect(memDC, &indRc, indBrush);
         DeleteObject(indBrush);
@@ -257,7 +520,7 @@ static void Render(HWND hwnd, HDC hdc) {
 
     // Tab 2 (速记笔记)
     if (g_appData.currentTab == 1) {
-        RECT indRc = { tabWidth + tabWidth / 2 - 34, tabY + TAB_HEIGHT - 3, tabWidth + tabWidth / 2 + 34, tabY + TAB_HEIGHT };
+        RECT indRc = { tabWidth + tabWidth / 2 - indHalfW, tabY + m.tabH - indH, tabWidth + tabWidth / 2 + indHalfW, tabY + m.tabH };
         HBRUSH indBrush = CreateSolidBrush(colors.accent);
         FillRect(memDC, &indRc, indBrush);
         DeleteObject(indBrush);
@@ -273,8 +536,8 @@ static void Render(HWND hwnd, HDC hdc) {
     // Tab 底部细分界线
     HPEN splitPen = CreatePen(PS_SOLID, 1, colors.cardBorder);
     HPEN oldPen = (HPEN)SelectObject(memDC, splitPen);
-    MoveToEx(memDC, 0, tabY + TAB_HEIGHT - 1, NULL);
-    LineTo(memDC, width, tabY + TAB_HEIGHT - 1);
+    MoveToEx(memDC, 0, tabY + m.tabH - 1, NULL);
+    LineTo(memDC, width, tabY + m.tabH - 1);
     SelectObject(memDC, oldPen);
     DeleteObject(splitPen);
 
@@ -285,11 +548,11 @@ static void Render(HWND hwnd, HDC hdc) {
         GetTodoStats(compCount, totalCount, percent);
 
         // 4.1 进度条区域卡片
-        int progY = tabY + TAB_HEIGHT + 10;
-        RECT progCardRc = { PADDING, progY, width - PADDING, progY + PROGRESS_AREA_HEIGHT };
-        DrawModernRoundRect(memDC, progCardRc, 8, colors.cardBg, colors.cardBorder);
+        int progY = tabY + m.tabH + ScaleDpi(10, dpi);
+        RECT progCardRc = { m.padding, progY, width - m.padding, progY + m.progressH };
+        DrawModernRoundRect(memDC, progCardRc, ScaleDpi(8, dpi), colors.cardBg, colors.cardBorder);
 
-        RECT progTextRc = { PADDING + 12, progY + 6, width - PADDING - 12, progY + 24 };
+        RECT progTextRc = { m.padding + ScaleDpi(12, dpi), progY + ScaleDpi(6, dpi), width - m.padding - ScaleDpi(12, dpi), progY + ScaleDpi(24, dpi) };
         SelectObject(memDC, g_hFontSmall);
         SetTextColor(memDC, colors.textSecondary);
 
@@ -298,46 +561,46 @@ static void Render(HWND hwnd, HDC hdc) {
         DrawTextW(memDC, statText, -1, &progTextRc, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
         // 进度槽
-        int barY = progY + 28;
-        int barH = 8;
-        int barW = width - PADDING * 2 - 24;
-        RECT barBgRc = { PADDING + 12, barY, PADDING + 12 + barW, barY + barH };
-        DrawModernRoundRect(memDC, barBgRc, 4, colors.progressBg, colors.progressBg);
+        int barY = progY + ScaleDpi(28, dpi);
+        int barH = ScaleDpi(8, dpi);
+        int barW = width - m.padding * 2 - ScaleDpi(24, dpi);
+        RECT barBgRc = { m.padding + ScaleDpi(12, dpi), barY, m.padding + ScaleDpi(12, dpi) + barW, barY + barH };
+        DrawModernRoundRect(memDC, barBgRc, ScaleDpi(4, dpi), colors.progressBg, colors.progressBg);
 
         int fillW = (int)(barW * percent);
         if (fillW > 0) {
-            RECT barFillRc = { PADDING + 12, barY, PADDING + 12 + fillW, barY + barH };
-            DrawModernRoundRect(memDC, barFillRc, 4, colors.accent, colors.accent);
+            RECT barFillRc = { m.padding + ScaleDpi(12, dpi), barY, m.padding + ScaleDpi(12, dpi) + fillW, barY + barH };
+            DrawModernRoundRect(memDC, barFillRc, ScaleDpi(4, dpi), colors.accent, colors.accent);
         }
 
         // 4.2 输入框外卡片
-        int inputCardY = progY + PROGRESS_AREA_HEIGHT + 8;
-        RECT inputCardRc = { PADDING, inputCardY, width - PADDING, inputCardY + 36 };
-        DrawModernRoundRect(memDC, inputCardRc, 8, colors.cardBg, colors.cardBorder);
+        int inputCardY = progY + m.progressH + ScaleDpi(8, dpi);
+        RECT inputCardRc = { m.padding, inputCardY, width - m.padding, inputCardY + m.inputCardH };
+        DrawModernRoundRect(memDC, inputCardRc, ScaleDpi(8, dpi), colors.cardBg, colors.cardBorder);
 
         // 4.3 待办事项列表
-        int listStartY = inputCardY + 36 + 10;
-        int listEndY = height - PADDING;
+        int listStartY = inputCardY + m.inputCardH + ScaleDpi(10, dpi);
+        int listEndY = height - m.padding;
         int currentY = listStartY - g_scrollOffset;
 
         if (g_appData.todos.empty()) {
-            RECT emptyRc = { 0, listStartY + 30, width, listStartY + 100 };
+            RECT emptyRc = { 0, listStartY + ScaleDpi(30, dpi), width, listStartY + ScaleDpi(100, dpi) };
             SelectObject(memDC, g_hFontNormal);
             SetTextColor(memDC, colors.textSecondary);
             DrawTextW(memDC, L"✨ 暂无待办，输入后按回车直接添加", -1, &emptyRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
         } else {
             for (size_t i = 0; i < g_appData.todos.size(); ++i) {
-                if (currentY + ITEM_HEIGHT > listStartY && currentY < listEndY) {
-                    RECT itemRc = { PADDING, currentY, width - PADDING, currentY + ITEM_HEIGHT - 4 };
+                if (currentY + m.itemH > listStartY && currentY < listEndY) {
+                    RECT itemRc = { m.padding, currentY, width - m.padding, currentY + m.itemH - ScaleDpi(4, dpi) };
 
                     bool isHovered = ((int)i == g_hoveredItemIdx);
                     COLORREF itemBg = isHovered ? colors.hoverOverlay : colors.cardBg;
-                    DrawModernRoundRect(memDC, itemRc, 8, itemBg, colors.cardBorder);
+                    DrawModernRoundRect(memDC, itemRc, ScaleDpi(8, dpi), itemBg, colors.cardBorder);
 
                     // 圆形复选框
-                    int boxSize = 18;
-                    int boxX = PADDING + 12;
-                    int boxY = currentY + (ITEM_HEIGHT - 4 - boxSize) / 2;
+                    int boxSize = ScaleDpi(18, dpi);
+                    int boxX = m.padding + ScaleDpi(12, dpi);
+                    int boxY = currentY + (m.itemH - ScaleDpi(4, dpi) - boxSize) / 2;
                     RECT checkRc = { boxX, boxY, boxX + boxSize, boxY + boxSize };
 
                     if (g_appData.todos[i].completed) {
@@ -350,7 +613,9 @@ static void Render(HWND hwnd, HDC hdc) {
                     }
 
                     // 待办文本
-                    RECT textRc = { boxX + boxSize + 12, currentY, width - PADDING - 36, currentY + ITEM_HEIGHT - 4 };
+                    int delSize = ScaleDpi(22, dpi);
+                    int delX = width - m.padding - ScaleDpi(30, dpi);
+                    RECT textRc = { boxX + boxSize + ScaleDpi(12, dpi), currentY, delX - ScaleDpi(6, dpi), currentY + m.itemH - ScaleDpi(4, dpi) };
                     if (g_appData.todos[i].completed) {
                         SelectObject(memDC, g_hFontStrike);
                         SetTextColor(memDC, colors.completedText);
@@ -362,14 +627,12 @@ static void Render(HWND hwnd, HDC hdc) {
 
                     // 悬浮删除按钮
                     if (isHovered) {
-                        int delSize = 22;
-                        int delX = width - PADDING - 30;
-                        int delY = currentY + (ITEM_HEIGHT - 4 - delSize) / 2;
+                        int delY = currentY + (m.itemH - ScaleDpi(4, dpi) - delSize) / 2;
                         RECT delRc = { delX, delY, delX + delSize, delY + delSize };
 
                         bool isDelHover = ((int)i == g_hoveredDeleteIdx);
                         if (isDelHover) {
-                            DrawModernRoundRect(memDC, delRc, 6, RGB(254, 226, 226), RGB(248, 113, 113));
+                            DrawModernRoundRect(memDC, delRc, ScaleDpi(6, dpi), RGB(254, 226, 226), RGB(248, 113, 113));
                             SetTextColor(memDC, RGB(220, 38, 38));
                         } else {
                             SetTextColor(memDC, colors.textSecondary);
@@ -378,14 +641,14 @@ static void Render(HWND hwnd, HDC hdc) {
                         DrawTextW(memDC, L"×", -1, &delRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
                     }
                 }
-                currentY += ITEM_HEIGHT;
+                currentY += m.itemH;
             }
         }
     }
 
-    // 5. Tab 1: 速记笔记格式工具栏渲染 (位于底端，完美对齐微软便签经典底部工具栏)
+    // 5. Tab 1: 速记笔记格式工具栏渲染 (1:1 像素级复刻微软便签经典底部工具栏)
     if (g_appData.currentTab == 1) {
-        int fmtY = height - FORMAT_BAR_HEIGHT;
+        int fmtY = height - m.formatBarH;
         RECT fmtBarRc = { 0, fmtY, width, height };
 
         HBRUSH fmtBrush = CreateSolidBrush(colors.headerBg);
@@ -399,22 +662,103 @@ static void Render(HWND hwnd, HDC hdc) {
         SelectObject(memDC, prevFmtPen);
         DeleteObject(fmtPen);
 
-        // 5 个工具按钮: [B 粗体] [I 斜体] [U 下划线] [S 删除线] [• 列表]
-        const wchar_t* btnLabels[] = { L"B", L"I", L"U", L"S", L"•" };
-        int btnW = 34;
-        int btnPad = 6;
-        int startX = PADDING;
-
-        for (int b = 1; b <= 5; ++b) {
-            RECT bRc = { startX, fmtY + 4, startX + btnW, height - 4 };
+        for (int b = 1; b <= NUM_FMT_BTNS; ++b) {
+            RECT bRc = GetFormatBtnRect(width, height, b, dpi);
             if (g_hoveredFmtBtn == b) {
-                DrawModernRoundRect(memDC, bRc, 6, colors.hoverOverlay, colors.cardBorder);
+                DrawModernRoundRect(memDC, bRc, ScaleDpi(5, dpi), colors.hoverOverlay, colors.cardBorder);
             }
+            int cx = (bRc.left + bRc.right) / 2;
+            int cy = (bRc.top + bRc.bottom) / 2;
             SetBkMode(memDC, TRANSPARENT);
-            SetTextColor(memDC, colors.textPrimary);
-            SelectObject(memDC, g_hFontFmt);
-            DrawTextW(memDC, btnLabels[b - 1], -1, &bRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-            startX += btnW + btnPad;
+
+            if (b == 1) {
+                // 加粗 (B)
+                SetTextColor(memDC, colors.textPrimary);
+                SelectObject(memDC, g_hFontFmtB);
+                RECT r = bRc;
+                DrawTextW(memDC, L"B", 1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            } else if (b == 2) {
+                // 斜体 (I - 衬线斜体)
+                SetTextColor(memDC, colors.textPrimary);
+                SelectObject(memDC, g_hFontFmtI);
+                RECT r = bRc;
+                DrawTextW(memDC, L"I", 1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            } else if (b == 3) {
+                // 下划线 (U 带清晰底横线)
+                SetTextColor(memDC, colors.textPrimary);
+                SelectObject(memDC, g_hFontFmtU);
+                RECT r = bRc;
+                r.bottom -= ScaleDpi(4, dpi);
+                DrawTextW(memDC, L"U", 1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                int penThick = ScaleDpi(2, dpi); if (penThick < 1) penThick = 1;
+                HPEN pen = CreatePen(PS_SOLID, penThick, colors.textPrimary);
+                HGDIOBJ oldP = SelectObject(memDC, pen);
+                int lineY = cy + ScaleDpi(8, dpi);
+                int lineHalfW = ScaleDpi(6, dpi);
+                MoveToEx(memDC, cx - lineHalfW, lineY, NULL);
+                LineTo(memDC, cx + lineHalfW + 1, lineY);
+                SelectObject(memDC, oldP);
+                DeleteObject(pen);
+            } else if (b == 4) {
+                // 删除线 (ab 中间贯穿横线)
+                SetTextColor(memDC, colors.textPrimary);
+                SelectObject(memDC, g_hFontFmtAB);
+                RECT r = bRc;
+                r.bottom -= ScaleDpi(1, dpi);
+                DrawTextW(memDC, L"ab", 2, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                int penThick = ScaleDpi(2, dpi); if (penThick < 1) penThick = 1;
+                HPEN pen = CreatePen(PS_SOLID, penThick, colors.textPrimary);
+                HGDIOBJ oldP = SelectObject(memDC, pen);
+                int lineY = cy + ScaleDpi(2, dpi);
+                int lineHalfW = ScaleDpi(9, dpi);
+                MoveToEx(memDC, cx - lineHalfW, lineY, NULL);
+                LineTo(memDC, cx + lineHalfW + 1, lineY);
+                SelectObject(memDC, oldP);
+                DeleteObject(pen);
+            } else if (b == 5) {
+                // 项目符号列表 (3组 圆点+横线)
+                HBRUSH dotBrush = CreateSolidBrush(colors.textPrimary);
+                int lineThick = ScaleDpi(2, dpi); if (lineThick < 1) lineThick = 1;
+                HPEN linePen = CreatePen(PS_SOLID, lineThick, colors.textPrimary);
+                HGDIOBJ oldP = SelectObject(memDC, linePen);
+                int dotW = ScaleDpi(3, dpi); if (dotW < 2) dotW = 2;
+                int dotLeft = cx - ScaleDpi(9, dpi);
+                int lineLeft = cx - ScaleDpi(3, dpi);
+                int lineRight = cx + ScaleDpi(9, dpi);
+                int spacing = ScaleDpi(5, dpi);
+                int rowYs[3] = { cy - spacing, cy, cy + spacing };
+                for (int i = 0; i < 3; ++i) {
+                    RECT dotRc = { dotLeft, rowYs[i] - dotW / 2, dotLeft + dotW, rowYs[i] + dotW / 2 + 1 };
+                    FillRect(memDC, &dotRc, dotBrush);
+                    MoveToEx(memDC, lineLeft, rowYs[i], NULL);
+                    LineTo(memDC, lineRight, rowYs[i]);
+                }
+                SelectObject(memDC, oldP);
+                DeleteObject(linePen);
+                DeleteObject(dotBrush);
+            } else if (b == 6) {
+                // 添加图像 (精致相框 + 山峰)
+                int fHalfW = ScaleDpi(8, dpi);
+                int fHalfH = ScaleDpi(6, dpi);
+                int fL = cx - fHalfW, fT = cy - fHalfH, fR = cx + fHalfW, fB = cy + fHalfH;
+                HPEN framePen = CreatePen(PS_SOLID, 1, colors.textPrimary);
+                HGDIOBJ oldP = SelectObject(memDC, framePen);
+                HGDIOBJ oldB = SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+                RoundRect(memDC, fL, fT, fR, fB, ScaleDpi(3, dpi), ScaleDpi(3, dpi));
+
+                // 左侧大山峰
+                MoveToEx(memDC, fL + ScaleDpi(2, dpi), fB - 1, NULL);
+                LineTo(memDC, fL + ScaleDpi(6, dpi), fT + ScaleDpi(4, dpi));
+                LineTo(memDC, fL + ScaleDpi(10, dpi), fB - 1);
+                // 右侧小山峰
+                MoveToEx(memDC, fL + ScaleDpi(8, dpi), fB - 1, NULL);
+                LineTo(memDC, fL + ScaleDpi(11, dpi), fT + ScaleDpi(6, dpi));
+                LineTo(memDC, fR - ScaleDpi(2, dpi), fB - 1);
+
+                SelectObject(memDC, oldB);
+                SelectObject(memDC, oldP);
+                DeleteObject(framePen);
+            }
         }
     }
 
@@ -448,13 +792,22 @@ void UpdateControlVisibility() {
 
 // 控件布局适配
 void LayoutControls(int width, int height) {
-    int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 10 + PROGRESS_AREA_HEIGHT + 8;
-    MoveWindow(g_hEditInput, PADDING + 12, inputCardY + 6, width - PADDING * 2 - 24, 24, TRUE);
+    UINT dpi = GetWindowDpi(g_hMainWnd);
+    LayoutMetrics m = GetMetrics(dpi);
+    int progY = m.headerH + m.tabH + ScaleDpi(10, dpi);
+    int inputCardY = progY + m.progressH + ScaleDpi(8, dpi);
+    int editPad = ScaleDpi(12, dpi);
+    int editH = ScaleDpi(22, dpi);
+    int editY = inputCardY + (m.inputCardH - editH) / 2;
+    MoveWindow(g_hEditInput, m.padding + editPad, editY, width - (m.padding + editPad) * 2, editH, TRUE);
 
     // 富文本 RichEdit (留出顶部 Tab 和底部格式栏的高度)
-    int memoY = HEADER_HEIGHT + TAB_HEIGHT + 6;
-    int memoH = height - memoY - FORMAT_BAR_HEIGHT - 6;
-    MoveWindow(g_hRichMemo, PADDING, memoY, width - PADDING * 2, memoH, TRUE);
+    int memoY = m.headerH + m.tabH + ScaleDpi(6, dpi);
+    int memoH = height - memoY - m.formatBarH - ScaleDpi(6, dpi);
+    MoveWindow(g_hRichMemo, m.padding, memoY, width - m.padding * 2, memoH, TRUE);
+
+    RECT marginsRc = { ScaleDpi(4, dpi), ScaleDpi(4, dpi), ScaleDpi(4, dpi), ScaleDpi(4, dpi) };
+    SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&marginsRc);
 }
 
 // 延时防抖落盘
@@ -490,30 +843,8 @@ LRESULT CALLBACK EditInputSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
-        g_hFontTitle = CreateFontW(17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
-        if (!g_hFontTitle) {
-            g_hFontTitle = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-        }
-
-        g_hFontNormal = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-
-        g_hFontStrike = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, TRUE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-
-        g_hFontSmall = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-
-        g_hFontFmt = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        UINT dpi = GetWindowDpi(hwnd);
+        UpdateFontsForDpi(dpi);
 
         // 待办输入框
         g_hEditInput = CreateWindowExW(
@@ -537,7 +868,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         SendMessage(g_hRichMemo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
         // 设置 RichEdit 边距与颜色
-        RECT marginsRc = { 4, 4, 4, 4 };
+        int margin = ScaleDpi(4, dpi);
+        RECT marginsRc = { margin, margin, margin, margin };
         SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&marginsRc);
 
         ColorScheme colors = GetThemeColors(g_appData.colorTheme);
@@ -548,6 +880,22 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         UpdateControlVisibility();
         TrayManager::AddTrayIcon(hwnd, g_appData.colorTheme);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        UINT newDpi = HIWORD(wParam);
+        RECT* prc = (RECT*)lParam;
+        if (prc) {
+            SetWindowPos(hwnd, NULL, prc->left, prc->top,
+                         prc->right - prc->left, prc->bottom - prc->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        UpdateFontsForDpi(newDpi);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        LayoutControls(rc.right - rc.left, rc.bottom - rc.top);
+        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
 
@@ -568,6 +916,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_SIZE: {
+        HideTooltip();
         int width = LOWORD(lParam);
         int height = HIWORD(lParam);
         g_appData.windowWidth = width;
@@ -579,6 +928,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_MOVE: {
+        HideTooltip();
         RECT rc;
         GetWindowRect(hwnd, &rc);
         g_appData.windowX = rc.left;
@@ -661,7 +1011,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc;
         GetWindowRect(hwnd, &rc);
-        int border = 8;
+        UINT dpi = GetWindowDpi(hwnd);
+        int border = ScaleDpi(8, dpi);
         bool left = pt.x >= rc.left && pt.x < rc.left + border;
         bool right = pt.x < rc.right && pt.x >= rc.right - border;
         bool top = pt.y >= rc.top && pt.y < rc.top + border;
@@ -680,6 +1031,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_LBUTTONDOWN: {
+        HideTooltip();
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
         RECT rc;
@@ -687,13 +1039,17 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         int width = rc.right - rc.left;
         int height = rc.bottom - rc.top;
 
+        UINT dpi = GetWindowDpi(hwnd);
+        LayoutMetrics m = GetMetrics(dpi);
+
         // 1. 顶部 Header
-        if (y < HEADER_HEIGHT) {
-            int btnY = (HEADER_HEIGHT - 28) / 2;
-            int btnH = 28;
+        if (y < m.headerH) {
+            RECT pinBtnRc = GetHeaderBtnRect(width, 1, dpi);
+            RECT themeBtnRc = GetHeaderBtnRect(width, 2, dpi);
+            RECT closeBtnRc = GetHeaderBtnRect(width, 3, dpi);
 
             // 置顶
-            if (x >= width - 102 && x < width - 72 && y >= btnY && y <= btnY + btnH) {
+            if (x >= pinBtnRc.left && x <= pinBtnRc.right && y >= pinBtnRc.top && y <= pinBtnRc.bottom) {
                 g_appData.isAlwaysOnTop = !g_appData.isAlwaysOnTop;
                 SetWindowPos(hwnd, g_appData.isAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                              0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -702,7 +1058,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 return 0;
             }
             // 切换主题色
-            if (x >= width - 68 && x < width - 38 && y >= btnY && y <= btnY + btnH) {
+            if (x >= themeBtnRc.left && x <= themeBtnRc.right && y >= themeBtnRc.top && y <= themeBtnRc.bottom) {
                 g_appData.colorTheme = (g_appData.colorTheme + 1) % 6;
                 ColorScheme colors = GetThemeColors(g_appData.colorTheme);
                 SendMessage(g_hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)colors.bodyBg);
@@ -712,7 +1068,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 return 0;
             }
             // 隐藏到托盘
-            if (x >= width - 34 && x <= width - 6 && y >= btnY && y <= btnY + btnH) {
+            if (x >= closeBtnRc.left && x <= closeBtnRc.right && y >= closeBtnRc.top && y <= closeBtnRc.bottom) {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
@@ -724,7 +1080,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
 
         // 2. Tab 切换
-        if (y >= HEADER_HEIGHT && y < HEADER_HEIGHT + TAB_HEIGHT) {
+        if (y >= m.headerH && y < m.headerH + m.tabH) {
             int newTab = (x < width / 2) ? 0 : 1;
             if (newTab != g_appData.currentTab) {
                 g_appData.currentTab = newTab;
@@ -737,13 +1093,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         // 3. Tab 0 待办事项交互
         if (g_appData.currentTab == 0) {
-            int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 10 + PROGRESS_AREA_HEIGHT + 8;
-            int listStartY = inputCardY + 36 + 10;
+            int inputCardY = m.headerH + m.tabH + ScaleDpi(10, dpi) + m.progressH + ScaleDpi(8, dpi);
+            int listStartY = inputCardY + m.inputCardH + ScaleDpi(10, dpi);
             if (y >= listStartY) {
-                int clickedIdx = (y - listStartY + g_scrollOffset) / ITEM_HEIGHT;
+                int clickedIdx = (y - listStartY + g_scrollOffset) / m.itemH;
                 if (clickedIdx >= 0 && clickedIdx < (int)g_appData.todos.size()) {
+                    int delBtnW = ScaleDpi(22, dpi);
+                    int delRight = width - m.padding - ScaleDpi(8, dpi);
+                    int delLeft = delRight - delBtnW;
                     // 删除
-                    if (x >= width - PADDING - 30 && x <= width - PADDING - 8) {
+                    if (x >= delLeft && x <= delRight) {
                         g_appData.todos.erase(g_appData.todos.begin() + clickedIdx);
                         InvalidateRect(hwnd, NULL, FALSE);
                         SaveDataDeferred(hwnd);
@@ -759,21 +1118,19 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
 
         // 4. Tab 1 富文本底部工具栏点击响应
-        if (g_appData.currentTab == 1 && y >= height - FORMAT_BAR_HEIGHT) {
-            int btnW = 34;
-            int btnPad = 6;
-            int startX = PADDING;
-
-            for (int b = 1; b <= 5; ++b) {
-                if (x >= startX && x <= startX + btnW) {
+        if (g_appData.currentTab == 1 && y >= height - m.formatBarH) {
+            for (int b = 1; b <= NUM_FMT_BTNS; ++b) {
+                RECT bRc = GetFormatBtnRect(width, height, b, dpi);
+                if (x >= bRc.left && x <= bRc.right && y >= bRc.top && y <= bRc.bottom) {
+                    HideTooltip();
                     if (b == 1) ApplyFormatToSelection(g_hRichMemo, CFM_BOLD, CFE_BOLD);
                     else if (b == 2) ApplyFormatToSelection(g_hRichMemo, CFM_ITALIC, CFE_ITALIC);
                     else if (b == 3) ApplyFormatToSelection(g_hRichMemo, CFM_UNDERLINE, CFE_UNDERLINE);
                     else if (b == 4) ApplyFormatToSelection(g_hRichMemo, CFM_STRIKEOUT, CFE_STRIKEOUT);
                     else if (b == 5) ToggleBullet(g_hRichMemo);
+                    else if (b == 6) InsertImageFromFile(hwnd, g_hRichMemo);
                     return 0;
                 }
-                startX += btnW + btnPad;
             }
         }
         break;
@@ -787,6 +1144,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         int width = rc.right - rc.left;
         int height = rc.bottom - rc.top;
 
+        UINT dpi = GetWindowDpi(hwnd);
+        LayoutMetrics m = GetMetrics(dpi);
+
         TRACKMOUSEEVENT tme = { sizeof(tme) };
         tme.dwFlags = TME_LEAVE;
         tme.hwndTrack = hwnd;
@@ -794,42 +1154,56 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         int prevHeaderBtn = g_hoveredHeaderBtn;
         g_hoveredHeaderBtn = 0;
-        if (y < HEADER_HEIGHT) {
-            int btnY = (HEADER_HEIGHT - 28) / 2;
-            int btnH = 28;
-            if (y >= btnY && y <= btnY + btnH) {
-                if (x >= width - 102 && x < width - 72) g_hoveredHeaderBtn = 1;
-                else if (x >= width - 68 && x < width - 38) g_hoveredHeaderBtn = 2;
-                else if (x >= width - 34 && x <= width - 6) g_hoveredHeaderBtn = 3;
+        if (y < m.headerH) {
+            for (int h = 1; h <= 3; ++h) {
+                RECT hRc = GetHeaderBtnRect(width, h, dpi);
+                if (x >= hRc.left && x <= hRc.right && y >= hRc.top && y <= hRc.bottom) {
+                    g_hoveredHeaderBtn = h;
+                    break;
+                }
             }
         }
 
         int prevFmtBtn = g_hoveredFmtBtn;
         g_hoveredFmtBtn = 0;
-        if (g_appData.currentTab == 1 && y >= height - FORMAT_BAR_HEIGHT) {
-            int btnW = 34;
-            int btnPad = 6;
-            int startX = PADDING;
-            for (int b = 1; b <= 5; ++b) {
-                if (x >= startX && x <= startX + btnW) {
+        if (g_appData.currentTab == 1 && y >= height - m.formatBarH) {
+            for (int b = 1; b <= NUM_FMT_BTNS; ++b) {
+                RECT bRc = GetFormatBtnRect(width, height, b, dpi);
+                if (x >= bRc.left && x <= bRc.right && y >= bRc.top && y <= bRc.bottom) {
                     g_hoveredFmtBtn = b;
                     break;
                 }
-                startX += btnW + btnPad;
             }
         }
 
+        // 动态展示/刷新/隐藏 Tooltip 提示
+        if (g_hoveredFmtBtn > 0) {
+            RECT bRc = GetFormatBtnRect(width, height, g_hoveredFmtBtn, dpi);
+            ShowTooltip(hwnd, FMT_BTN_TITLES[g_hoveredFmtBtn - 1], bRc, true, dpi);
+        } else if (g_hoveredHeaderBtn > 0) {
+            RECT hRc = GetHeaderBtnRect(width, g_hoveredHeaderBtn, dpi);
+            std::wstring hText = (g_hoveredHeaderBtn == 1) ?
+                (g_appData.isAlwaysOnTop ? L"取消置顶" : L"置顶窗口") :
+                HEADER_BTN_TITLES[g_hoveredHeaderBtn - 1];
+            ShowTooltip(hwnd, hText, hRc, false, dpi);
+        } else {
+            HideTooltip();
+        }
+
         if (g_appData.currentTab == 0) {
-            int inputCardY = HEADER_HEIGHT + TAB_HEIGHT + 10 + PROGRESS_AREA_HEIGHT + 8;
-            int listStartY = inputCardY + 36 + 10;
+            int inputCardY = m.headerH + m.tabH + ScaleDpi(10, dpi) + m.progressH + ScaleDpi(8, dpi);
+            int listStartY = inputCardY + m.inputCardH + ScaleDpi(10, dpi);
             int prevHovered = g_hoveredItemIdx;
             int prevDel = g_hoveredDeleteIdx;
 
             if (y >= listStartY) {
-                int hoverIdx = (y - listStartY + g_scrollOffset) / ITEM_HEIGHT;
+                int hoverIdx = (y - listStartY + g_scrollOffset) / m.itemH;
                 if (hoverIdx >= 0 && hoverIdx < (int)g_appData.todos.size()) {
                     g_hoveredItemIdx = hoverIdx;
-                    if (x >= width - PADDING - 30 && x <= width - PADDING - 8) {
+                    int delBtnW = ScaleDpi(22, dpi);
+                    int delRight = width - m.padding - ScaleDpi(8, dpi);
+                    int delLeft = delRight - delBtnW;
+                    if (x >= delLeft && x <= delRight) {
                         g_hoveredDeleteIdx = hoverIdx;
                     } else {
                         g_hoveredDeleteIdx = -1;
@@ -855,6 +1229,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_MOUSELEAVE: {
+        HideTooltip();
         g_hoveredItemIdx = -1;
         g_hoveredDeleteIdx = -1;
         g_hoveredHeaderBtn = 0;
@@ -863,10 +1238,17 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case WM_KILLFOCUS: {
+        HideTooltip();
+        break;
+    }
+
     case WM_MOUSEWHEEL: {
         if (g_appData.currentTab == 0) {
+            UINT dpi = GetWindowDpi(hwnd);
+            LayoutMetrics m = GetMetrics(dpi);
             short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_scrollOffset -= (delta / WHEEL_DELTA) * ITEM_HEIGHT;
+            g_scrollOffset -= (delta / WHEEL_DELTA) * m.itemH;
             if (g_scrollOffset < 0) g_scrollOffset = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -882,6 +1264,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_DESTROY: {
+        HideTooltip();
+        if (g_hTooltipWnd) DestroyWindow(g_hTooltipWnd);
         SyncRichTextSave(hwnd);
         DataStore::Save(g_appData);
         TrayManager::RemoveTrayIcon(hwnd);
@@ -889,7 +1273,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         if (g_hFontNormal) DeleteObject(g_hFontNormal);
         if (g_hFontStrike) DeleteObject(g_hFontStrike);
         if (g_hFontSmall) DeleteObject(g_hFontSmall);
-        if (g_hFontFmt) DeleteObject(g_hFontFmt);
+        if (g_hFontFmtB) DeleteObject(g_hFontFmtB);
+        if (g_hFontFmtI) DeleteObject(g_hFontFmtI);
+        if (g_hFontFmtU) DeleteObject(g_hFontFmtU);
+        if (g_hFontFmtAB) DeleteObject(g_hFontFmtAB);
         PostQuitMessage(0);
         return 0;
     }
@@ -906,17 +1293,35 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     g_hInstance = hInstance;
 
+    // 启用 Per-Monitor V2 高 DPI 感知 (Windows 10 1703+)
+    typedef BOOL(WINAPI* PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+    PFN_SetProcessDpiAwarenessContext pfnSetDpiContext = 
+        (PFN_SetProcessDpiAwarenessContext)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+    if (pfnSetDpiContext) {
+        pfnSetDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    } else {
+        typedef HRESULT(WINAPI* PFN_SetProcessDpiAwareness)(int);
+        PFN_SetProcessDpiAwareness pfnSetDpi = 
+            (PFN_SetProcessDpiAwareness)GetProcAddress(GetModuleHandleW(L"shcore.dll"), "SetProcessDpiAwareness");
+        if (pfnSetDpi) {
+            pfnSetDpi(2); // PROCESS_PER_MONITOR_DPI_AWARE
+        } else {
+            SetProcessDPIAware();
+        }
+    }
+
     // 加载 Windows 高级富文本支持库
     g_hMsftEdit = LoadLibraryW(L"msftedit.dll");
 
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyStickyNotes_SingleInstance_Mutex_v3");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"MyStickyNotes_SingleInstance_Mutex_v4");
+    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existingWnd = FindWindowW(L"MyStickyNotes_Main", NULL);
         if (existingWnd) {
             ShowWindow(existingWnd, SW_SHOW);
             SetForegroundWindow(existingWnd);
+            CloseHandle(hMutex);
+            return 0;
         }
-        return 0;
     }
 
     INITCOMMONCONTROLSEX icex;
@@ -924,7 +1329,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     icex.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icex);
 
+    // 初始化 GDI+ (支持图片插入)
+    ULONG_PTR gdiplusToken = 0;
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
     DataStore::Load(g_appData);
+
+    // 首次在非 96 DPI（高分屏）下启动时，若读取到的历史尺寸是低分屏 96 DPI 未缩放默认值（如宽 340），等比自适应初次放大
+    UINT sysDpi = GetWindowDpi(NULL);
+    if (sysDpi > 96 && g_appData.windowWidth <= 360) {
+        g_appData.windowWidth = ScaleDpi(g_appData.windowWidth, sysDpi);
+        g_appData.windowHeight = ScaleDpi(g_appData.windowHeight, sysDpi);
+    }
+
+    // 防止窗口因显示器分辨率或扩展屏变动跑到屏幕可视区域之外
+    int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (g_appData.windowX < vLeft - 100 || g_appData.windowX > vLeft + vWidth - 100 ||
+        g_appData.windowY < vTop - 50 || g_appData.windowY > vTop + vHeight - 100) {
+        g_appData.windowX = 100;
+        g_appData.windowY = 100;
+    }
+
+    // 0. Tooltip 悬浮提示窗口类
+    WNDCLASSEXW twc = { sizeof(twc) };
+    twc.lpfnWndProc = TooltipWndProc;
+    twc.hInstance = hInstance;
+    twc.lpszClassName = L"StickyNotes_Tooltip";
+    twc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    twc.style = CS_DROPSHADOW;
+    RegisterClassExW(&twc);
 
     // 1. Owner Window
     WNDCLASSEXW owc = { sizeof(owc) };
@@ -966,6 +1403,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     if (!g_hMainWnd) return 0;
 
+    // 创建悬浮提示 Tooltip 窗口
+    g_hTooltipWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"StickyNotes_Tooltip", L"",
+        WS_POPUP,
+        0, 0, 0, 0,
+        g_hMainWnd, NULL, hInstance, NULL
+    );
+
     DWM_WINDOW_CORNER_PREFERENCE pref = DWMWCP_ROUND;
     DwmSetWindowAttribute(g_hMainWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
     MARGINS margins = { 1, 1, 1, 1 };
@@ -982,5 +1428,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     if (hMutex) CloseHandle(hMutex);
     if (g_hMsftEdit) FreeLibrary(g_hMsftEdit);
+    if (gdiplusToken) Gdiplus::GdiplusShutdown(gdiplusToken);
     return (int)msg.wParam;
 }
