@@ -18,6 +18,8 @@
 #define ID_EDIT_INPUT       1001
 #define ID_RICH_MEMO        1003
 #define ID_TIMER_SAVE       1004
+#define ID_TIMER_EDGE_CHECK 1005
+#define ID_TIMER_EDGE_ANIM  1006
 
 // 格式工具栏按钮提示文字
 static const wchar_t* FMT_BTN_TITLES[] = {
@@ -63,6 +65,25 @@ static int g_hoveredDeleteIdx = -1;
 static int g_hoveredHeaderBtn = 0; // 1: Pin, 2: Theme, 3: Close/Min
 static int g_hoveredFmtBtn = 0;    // 1..6
 
+// 边缘贴边与自动收起状态机
+enum EdgeDockState {
+    EDGE_NONE = 0,
+    EDGE_LEFT = 1,
+    EDGE_RIGHT = 2,
+    EDGE_TOP = 3
+};
+
+static EdgeDockState g_dockState = EDGE_NONE;
+static bool g_isCollapsed = false;
+static bool g_isMoving = false;
+static RECT g_expandedRect = { 0 };
+static int g_leaveCounter = 0;
+
+static int g_animStartX = 0, g_animStartY = 0;
+static int g_animTargetX = 0, g_animTargetY = 0;
+static int g_animStep = 0;
+static const int DOCK_ANIM_TOTAL_STEPS = 5;
+
 // 函数声明
 LRESULT CALLBACK OwnerWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -74,6 +95,88 @@ void LayoutControls(int width, int height);
 void UpdateFontsForDpi(UINT dpi);
 void ShowTooltip(HWND hParent, const std::wstring& text, RECT targetRect, bool above, UINT dpi);
 void HideTooltip();
+
+// 边缘贴边辅助方法
+static RECT GetCurrentMonitorWorkArea(HWND hwnd) {
+    HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(hMon, &mi)) {
+        return mi.rcWork;
+    }
+    RECT rc;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
+    return rc;
+}
+
+static POINT GetCollapsedPosition(HWND hwnd, EdgeDockState dock, const RECT& expRect, UINT dpi) {
+    RECT workRc = GetCurrentMonitorWorkArea(hwnd);
+    int width = expRect.right - expRect.left;
+    int height = expRect.bottom - expRect.top;
+    int peek = ScaleDpi(5, dpi);
+
+    POINT pt = { expRect.left, expRect.top };
+    if (dock == EDGE_LEFT) {
+        pt.x = workRc.left - width + peek;
+        pt.y = expRect.top;
+    } else if (dock == EDGE_RIGHT) {
+        pt.x = workRc.right - peek;
+        pt.y = expRect.top;
+    } else if (dock == EDGE_TOP) {
+        pt.x = expRect.left;
+        pt.y = workRc.top - height + peek;
+    }
+    return pt;
+}
+
+static void ExpandDockedWindow(HWND hwnd) {
+    if (!g_isCollapsed) return;
+    g_isCollapsed = false;
+    KillTimer(hwnd, ID_TIMER_EDGE_ANIM);
+
+    RECT curRc;
+    GetWindowRect(hwnd, &curRc);
+    g_animStartX = curRc.left;
+    g_animStartY = curRc.top;
+    g_animTargetX = g_expandedRect.left;
+    g_animTargetY = g_expandedRect.top;
+    g_animStep = 0;
+
+    SetTimer(hwnd, ID_TIMER_EDGE_ANIM, 12, NULL);
+}
+
+static void CollapseDockedWindow(HWND hwnd) {
+    if (g_isCollapsed || g_dockState == EDGE_NONE) return;
+    HideTooltip();
+    g_isCollapsed = true;
+    KillTimer(hwnd, ID_TIMER_EDGE_ANIM);
+
+    UINT dpi = GetWindowDpi(hwnd);
+    POINT targetPt = GetCollapsedPosition(hwnd, g_dockState, g_expandedRect, dpi);
+
+    RECT curRc;
+    GetWindowRect(hwnd, &curRc);
+    g_animStartX = curRc.left;
+    g_animStartY = curRc.top;
+    g_animTargetX = targetPt.x;
+    g_animTargetY = targetPt.y;
+    g_animStep = 0;
+
+    SetTimer(hwnd, ID_TIMER_EDGE_ANIM, 12, NULL);
+}
+
+static void ResetDockState(HWND hwnd) {
+    if (g_dockState != EDGE_NONE || g_isCollapsed) {
+        KillTimer(hwnd, ID_TIMER_EDGE_ANIM);
+        KillTimer(hwnd, ID_TIMER_EDGE_CHECK);
+        if (g_isCollapsed && (g_expandedRect.right > g_expandedRect.left)) {
+            SetWindowPos(hwnd, NULL, g_expandedRect.left, g_expandedRect.top, 0, 0,
+                         SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        g_dockState = EDGE_NONE;
+        g_isCollapsed = false;
+        g_leaveCounter = 0;
+    }
+}
 
 // 悬浮提示 Tooltip 窗口过程
 LRESULT CALLBACK TooltipWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -210,6 +313,27 @@ void UpdateFontsForDpi(UINT dpi) {
     // Win32 RichEdit 接收 WM_SETFONT 会彻底重置整个文档为纯文本并擦除加粗、斜体、下划线等所有样式。
 }
 
+// 同步主题配色到内部编辑控件（解决暗色/亮色切换时字体颜色失配看不见的问题）
+void ApplyThemeToControls(int theme) {
+    ColorScheme colors = GetThemeColors(theme);
+    if (g_hRichMemo) {
+        SendMessage(g_hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)colors.bodyBg);
+
+        CHARFORMAT2W cf = { sizeof(cf) };
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = colors.textPrimary;
+        cf.dwEffects = 0; // 清除自动颜色标记，强制应用主题前景字色
+
+        // 1. 设置默认字色（供光标后续输入的新文本使用）
+        SendMessage(g_hRichMemo, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+        // 2. 将字色同步更新到当前文档的所有现有文本
+        SendMessage(g_hRichMemo, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    }
+    if (g_hEditInput) {
+        InvalidateRect(g_hEditInput, NULL, TRUE);
+    }
+}
+
 // 控件显隐管理
 void UpdateControlVisibility() {
     if (g_appData.currentTab == 0) {
@@ -327,11 +451,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         RECT marginsRc = { margin, margin, margin, margin };
         SendMessage(g_hRichMemo, EM_SETRECT, 0, (LPARAM)&marginsRc);
 
-        ColorScheme colors = GetThemeColors(g_appData.colorTheme);
-        SendMessage(g_hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)colors.bodyBg);
-
         // 加载 RTF 格式
         LoadRichTextToControl(g_hRichMemo, g_appData.memoRtf);
+
+        // 统一应用主题色（背景色与富文本文字前景色）
+        ApplyThemeToControls(g_appData.colorTheme);
 
         UpdateControlVisibility();
         TrayManager::AddTrayIcon(hwnd, g_appData.colorTheme);
@@ -384,8 +508,71 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     case WM_MOVE: {
         HideTooltip();
+        if (!g_isCollapsed) {
+            RECT rc;
+            GetWindowRect(hwnd, &rc);
+            g_appData.windowX = rc.left;
+            g_appData.windowY = rc.top;
+            SaveDataDeferred(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_ENTERSIZEMOVE: {
+        g_isMoving = true;
+        if (g_isCollapsed) {
+            g_isCollapsed = false;
+            KillTimer(hwnd, ID_TIMER_EDGE_ANIM);
+            SetWindowPos(hwnd, NULL, g_expandedRect.left, g_expandedRect.top, 0, 0,
+                         SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        break;
+    }
+
+    case WM_EXITSIZEMOVE: {
+        g_isMoving = false;
         RECT rc;
         GetWindowRect(hwnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        if (g_appData.isAlwaysOnTop) {
+            UINT dpi = GetWindowDpi(hwnd);
+            RECT workRc = GetCurrentMonitorWorkArea(hwnd);
+            int threshold = ScaleDpi(20, dpi);
+
+            EdgeDockState newDock = EDGE_NONE;
+            if (rc.left <= workRc.left + threshold) {
+                newDock = EDGE_LEFT;
+                rc.left = workRc.left;
+                rc.right = rc.left + w;
+            } else if (rc.right >= workRc.right - threshold) {
+                newDock = EDGE_RIGHT;
+                rc.left = workRc.right - w;
+                rc.right = workRc.right;
+            } else if (rc.top <= workRc.top + threshold) {
+                newDock = EDGE_TOP;
+                rc.top = workRc.top;
+                rc.bottom = rc.top + h;
+            }
+
+            if (newDock != EDGE_NONE) {
+                SetWindowPos(hwnd, NULL, rc.left, rc.top, 0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+                g_dockState = newDock;
+                g_expandedRect = rc;
+                g_isCollapsed = false;
+                g_leaveCounter = 0;
+
+                g_appData.windowX = rc.left;
+                g_appData.windowY = rc.top;
+                SaveDataDeferred(hwnd);
+
+                SetTimer(hwnd, ID_TIMER_EDGE_CHECK, 100, NULL);
+                return 0;
+            }
+        }
+
+        ResetDockState(hwnd);
         g_appData.windowX = rc.left;
         g_appData.windowY = rc.top;
         SaveDataDeferred(hwnd);
@@ -397,6 +584,58 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             KillTimer(hwnd, ID_TIMER_SAVE);
             g_appData.memoRtf = GetRichTextFromControl(g_hRichMemo);
             DataStore::Save(g_appData);
+            return 0;
+        }
+
+        if (wParam == ID_TIMER_EDGE_ANIM) {
+            g_animStep++;
+            float t = (float)g_animStep / DOCK_ANIM_TOTAL_STEPS;
+            if (t >= 1.0f) {
+                t = 1.0f;
+                KillTimer(hwnd, ID_TIMER_EDGE_ANIM);
+            }
+            float ease = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+            int curX = g_animStartX + (int)((g_animTargetX - g_animStartX) * ease);
+            int curY = g_animStartY + (int)((g_animTargetY - g_animStartY) * ease);
+            SetWindowPos(hwnd, NULL, curX, curY, 0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+            return 0;
+        }
+
+        if (wParam == ID_TIMER_EDGE_CHECK) {
+            if (g_dockState == EDGE_NONE || !g_appData.isAlwaysOnTop || g_isMoving) {
+                return 0;
+            }
+
+            POINT pt;
+            GetCursorPos(&pt);
+            RECT curRc;
+            GetWindowRect(hwnd, &curRc);
+
+            if (g_isCollapsed) {
+                RECT hitRc = curRc;
+                InflateRect(&hitRc, 3, 3);
+                if (PtInRect(&hitRc, pt)) {
+                    ExpandDockedWindow(hwnd);
+                }
+            } else {
+                RECT hitRc = curRc;
+                InflateRect(&hitRc, 8, 8);
+
+                bool isMousePressed = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                HWND hFocus = GetFocus();
+                bool isEditing = (hFocus == g_hRichMemo || hFocus == g_hEditInput || IsChild(hwnd, hFocus));
+
+                if (!PtInRect(&hitRc, pt) && !isMousePressed && !isEditing) {
+                    g_leaveCounter++;
+                    if (g_leaveCounter >= 3) {
+                        g_leaveCounter = 0;
+                        CollapseDockedWindow(hwnd);
+                    }
+                } else {
+                    g_leaveCounter = 0;
+                }
+            }
+            return 0;
         }
         return 0;
     }
@@ -413,6 +652,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         // 托盘菜单
         if (id == ID_TRAY_SHOW) {
             ShowWindow(hwnd, SW_SHOW);
+            if (g_isCollapsed) {
+                ExpandDockedWindow(hwnd);
+            }
             SetForegroundWindow(hwnd);
             return 0;
         }
@@ -426,6 +668,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             g_appData.isAlwaysOnTop = !g_appData.isAlwaysOnTop;
             SetWindowPos(hwnd, g_appData.isAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                          0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            if (!g_appData.isAlwaysOnTop) {
+                ResetDockState(hwnd);
+            } else {
+                SendMessage(hwnd, WM_EXITSIZEMOVE, 0, 0);
+            }
             InvalidateRect(hwnd, NULL, FALSE);
             SaveDataDeferred(hwnd);
             return 0;
@@ -433,8 +680,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         if (id >= ID_TRAY_COLOR_BASE && id <= ID_TRAY_COLOR_BASE + 5) {
             g_appData.colorTheme = id - ID_TRAY_COLOR_BASE;
-            ColorScheme colors = GetThemeColors(g_appData.colorTheme);
-            SendMessage(g_hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)colors.bodyBg);
+            ApplyThemeToControls(g_appData.colorTheme);
             TrayManager::UpdateTrayIcon(hwnd, g_appData.colorTheme);
             InvalidateRect(hwnd, NULL, TRUE);
             SaveDataDeferred(hwnd);
@@ -454,6 +700,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 ShowWindow(hwnd, SW_HIDE);
             } else {
                 ShowWindow(hwnd, SW_SHOW);
+                if (g_isCollapsed) {
+                    ExpandDockedWindow(hwnd);
+                }
                 SetForegroundWindow(hwnd);
             }
         } else if (lParam == WM_RBUTTONUP) {
@@ -463,6 +712,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_NCHITTEST: {
+        if (g_isCollapsed) {
+            return HTCLIENT;
+        }
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc;
         GetWindowRect(hwnd, &rc);
@@ -486,6 +738,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_LBUTTONDOWN: {
+        if (g_isCollapsed && g_dockState != EDGE_NONE) {
+            ExpandDockedWindow(hwnd);
+            return 0;
+        }
         HideTooltip();
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
@@ -507,14 +763,18 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_appData.isAlwaysOnTop = !g_appData.isAlwaysOnTop;
                 SetWindowPos(hwnd, g_appData.isAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                              0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                if (!g_appData.isAlwaysOnTop) {
+                    ResetDockState(hwnd);
+                } else {
+                    SendMessage(hwnd, WM_EXITSIZEMOVE, 0, 0);
+                }
                 InvalidateRect(hwnd, NULL, FALSE);
                 SaveDataDeferred(hwnd);
                 return 0;
             }
             if (x >= themeBtnRc.left && x <= themeBtnRc.right && y >= themeBtnRc.top && y <= themeBtnRc.bottom) {
                 g_appData.colorTheme = (g_appData.colorTheme + 1) % 6;
-                ColorScheme colors = GetThemeColors(g_appData.colorTheme);
-                SendMessage(g_hRichMemo, EM_SETBKGNDCOLOR, 0, (LPARAM)colors.bodyBg);
+                ApplyThemeToControls(g_appData.colorTheme);
                 TrayManager::UpdateTrayIcon(hwnd, g_appData.colorTheme);
                 InvalidateRect(hwnd, NULL, TRUE);
                 SaveDataDeferred(hwnd);
@@ -589,6 +849,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_MOUSEMOVE: {
+        if (g_isCollapsed && g_dockState != EDGE_NONE) {
+            ExpandDockedWindow(hwnd);
+        }
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
         RECT rc;
@@ -877,6 +1140,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     ShowWindow(g_hMainWnd, SW_SHOW);
     UpdateWindow(g_hMainWnd);
+
+    // 若开启置顶，初始化检测边缘贴边状态
+    if (g_appData.isAlwaysOnTop) {
+        SendMessage(g_hMainWnd, WM_EXITSIZEMOVE, 0, 0);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {

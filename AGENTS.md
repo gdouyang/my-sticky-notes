@@ -65,8 +65,10 @@ my-sticky-notes/
 ### 3.4 数据模型与持久化 (`data_store.h` / `data_store.cpp`)
 - **职责**：
   - 定义内存核心状态结构 `AppData`（窗口坐标、宽高、置顶状态、主题色编号、当前 Tab 索引、RTF 文本流、待办项数组）。
-  - 保证存盘路径位于 `%APPDATA%\MyStickyNotes\notes_data.json`。
-  - 提供 UTF-8 编码的 JSON 序列化与反序列化解析。
+  - **双文件分流持久化架构**（位于 `%APPDATA%\MyStickyNotes\`）：
+    - `notes_data.json`：仅保存轻量级窗口坐标尺寸、置顶状态、主题编号、当前 Tab 及待办项数组（JSON 保持小巧干净，避免体积膨胀）。
+    - `memo_notes.rtf`：独立二进制存储富文本速记便签内容，免除 JSON 字符转义开销，提升 IO 效率且可独立被外部编辑器查看。
+  - **平滑兼容机制**：`Load` 优先读取 `memo_notes.rtf`，如不存在则自动回退提取历史 `notes_data.json` 中的 `memoRtf` 并于保存时自动分流迁移。
 - **约定**：主窗口通过防抖定时器（`ID_TIMER_SAVE`，300ms 延时）触发落盘，避免高频按键或窗口拖动造成的性能开销。
 
 ### 3.5 托盘管理模块 (`tray.h` / `tray.cpp`)
@@ -81,7 +83,12 @@ my-sticky-notes/
   - 进程级 Per-Monitor V2 DPI 上下文初始化。
   - 单例互斥体管理（避免多开并自动唤醒已有实例）。
   - 创建并维护三个核心窗口：所有者窗口 `MyStickyNotes_Owner`（隐藏任务栏图标）、主窗口 `MyStickyNotes_Main`（POPUP 拟态卡片窗口）、悬浮提示层 `StickyNotes_Tooltip`（无阻断穿透浮层）。
-  - 消息循环分发：响应 `WM_CREATE`、`WM_DPICHANGED`、`WM_SIZE`、`WM_MOUSEMOVE`（Hover 与 Tooltip 触发）、`WM_LBUTTONDOWN`（按钮点击与拖动）、`WM_NCHITTEST`（无边框卡片 8 向自由拉伸）。
+  - **置顶贴边自动收起引擎（Edge Dock & Auto-Hide）**：
+    - 当窗口处于置顶（Pin）状态下被拖动靠紧屏幕左、右或顶部工作区边缘（<= 20px 容差）时，自动吸附；
+    - 当鼠标离开窗口且无编辑焦点时，300ms 防误触延时后自动收起至屏幕边缘（露出 5px 主题色感应细边）；
+    - 鼠标划过或点击露出边缘时，通过 60fps 平滑插值动画自动展开展示；
+    - 拖离边缘或取消置顶时自动解除吸附还原。
+  - 消息循环分发：响应 `WM_CREATE`、`WM_DPICHANGED`、`WM_SIZE`、`WM_MOVE`、`WM_ENTERSIZEMOVE`、`WM_EXITSIZEMOVE`、`WM_MOUSEMOVE`（Hover 与 Tooltip 触发）、`WM_LBUTTONDOWN`（按钮点击与拖动）、`WM_NCHITTEST`（无边框卡片 8 向自由拉伸）。
 - **约定**：保持 `main.cpp` 专注作为调度控制器，行数应控制在合理规模，禁止在此堆积大量绘制与业务算法细节。
 
 ---

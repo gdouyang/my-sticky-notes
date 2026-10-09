@@ -62,10 +62,33 @@ std::wstring DataStore::GetDataFilePath() {
     return L"notes_data.json";
 }
 
+std::wstring DataStore::GetMemoFilePath() {
+    wchar_t appDataPath[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appDataPath))) {
+        std::wstring dir = std::wstring(appDataPath) + L"\\MyStickyNotes";
+        CreateDirectoryW(dir.c_str(), NULL);
+        return dir + L"\\memo_notes.rtf";
+    }
+    return L"memo_notes.rtf";
+}
+
 bool DataStore::Load(AppData& data) {
+    // 1. 优先尝试读取独立的 memo_notes.rtf 文件
+    bool memoLoaded = false;
+    std::wstring memoPath = GetMemoFilePath();
+    std::ifstream memoFile(WideToUtf8(memoPath), std::ios::binary);
+    if (memoFile.is_open()) {
+        std::stringstream memoBuf;
+        memoBuf << memoFile.rdbuf();
+        data.memoRtf = memoBuf.str();
+        memoFile.close();
+        memoLoaded = true;
+    }
+
+    // 2. 读取主配置与待办列表 JSON 文件
     std::wstring path = GetDataFilePath();
     std::ifstream file(WideToUtf8(path), std::ios::binary);
-    if (!file.is_open()) return false;
+    if (!file.is_open()) return memoLoaded;
 
     std::stringstream buffer;
     buffer << file.rdbuf();
@@ -120,10 +143,12 @@ bool DataStore::Load(AppData& data) {
     data.windowY = findInt("windowY", 150);
     data.windowWidth = findInt("windowWidth", 360);
     data.windowHeight = findInt("windowHeight", 520);
-    data.isAlwaysOnTop = findBool("isAlwaysOnTop", false);
+    data.isAlwaysOnTop = findBool("isAlwaysOnTop", true);
     data.colorTheme = findInt("colorTheme", COLOR_YELLOW);
     data.currentTab = findInt("currentTab", 0);
-    data.memoRtf = findString("memoRtf");
+    if (!memoLoaded) {
+        data.memoRtf = findString("memoRtf");
+    }
 
     // 解析 todos 数组
     data.todos.clear();
@@ -176,6 +201,15 @@ bool DataStore::Load(AppData& data) {
 }
 
 bool DataStore::Save(const AppData& data) {
+    // 1. 独立保存富文本速记内容到 memo_notes.rtf
+    std::wstring memoPath = GetMemoFilePath();
+    std::ofstream memoFile(WideToUtf8(memoPath), std::ios::binary | std::ios::trunc);
+    if (memoFile.is_open()) {
+        memoFile.write(data.memoRtf.data(), data.memoRtf.size());
+        memoFile.close();
+    }
+
+    // 2. 保存轻量元数据与待办列表到 notes_data.json
     std::wstring path = GetDataFilePath();
     std::ofstream file(WideToUtf8(path), std::ios::binary | std::ios::trunc);
     if (!file.is_open()) return false;
@@ -188,7 +222,6 @@ bool DataStore::Save(const AppData& data) {
     file << "  \"isAlwaysOnTop\": " << (data.isAlwaysOnTop ? "true" : "false") << ",\n";
     file << "  \"colorTheme\": " << data.colorTheme << ",\n";
     file << "  \"currentTab\": " << data.currentTab << ",\n";
-    file << "  \"memoRtf\": \"" << EscapeJsonString(data.memoRtf) << "\",\n";
     file << "  \"todos\": [\n";
 
     for (size_t i = 0; i < data.todos.size(); ++i) {

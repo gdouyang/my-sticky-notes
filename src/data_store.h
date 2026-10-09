@@ -23,7 +23,7 @@ struct AppData {
     int windowY = 150;
     int windowWidth = 360;
     int windowHeight = 520;
-    bool isAlwaysOnTop = false;
+    bool isAlwaysOnTop = true;
     int colorTheme = COLOR_YELLOW; // 主题色彩
     int currentTab = 0; // 0: 待办清单, 1: 随手速记
     std::string memoRtf; // 富文本 RTF 内容 (格式与排版持久化)
@@ -33,6 +33,7 @@ struct AppData {
 class DataStore {
 public:
     static std::wstring GetDataFilePath();
+    static std::wstring GetMemoFilePath();
     static bool Load(AppData& data);
     static bool Save(const AppData& data);
 };
