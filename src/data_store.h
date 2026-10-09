@@ -18,22 +18,30 @@ struct TodoItem {
     bool completed = false;
 };
 
-struct AppData {
+struct NoteCardData {
+    std::string noteId = "default";
     int windowX = 150;
     int windowY = 150;
     int windowWidth = 360;
     int windowHeight = 520;
     bool isAlwaysOnTop = true;
+    int opacity = 100; // 100, 90, 80 (%)
     int colorTheme = COLOR_YELLOW; // 主题色彩
     int currentTab = 0; // 0: 待办清单, 1: 随手速记
-    std::string memoRtf; // 富文本 RTF 内容 (格式与排版持久化)
+    std::string memoRtf; // 富文本 RTF 内容
     std::vector<TodoItem> todos;
+};
+
+struct AppData {
+    int globalOpacity = 100;
+    int nextNoteId = 1;
+    std::vector<NoteCardData> notes;
 };
 
 class DataStore {
 public:
     static std::wstring GetDataFilePath();
-    static std::wstring GetMemoFilePath();
+    static std::wstring GetMemoFilePath(const std::string& noteId = "default");
     static bool Load(AppData& data);
     static bool Save(const AppData& data);
 };

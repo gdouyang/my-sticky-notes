@@ -87,6 +87,24 @@ inline void ToggleBullet(HWND hRich) {
     SetFocus(hRich);
 }
 
+// 荧光笔高亮 (柔和明黄底色)
+inline void ToggleHighlight(HWND hRich) {
+    CHARFORMAT2W cf = { sizeof(cf) };
+    cf.dwMask = CFM_BACKCOLOR;
+    SendMessageW(hRich, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+    COLORREF highlightYellow = RGB(254, 240, 138);
+    if ((cf.dwEffects & CFE_AUTOBACKCOLOR) == 0 && cf.crBackColor == highlightYellow) {
+        cf.dwEffects = CFE_AUTOBACKCOLOR;
+        cf.crBackColor = 0;
+    } else {
+        cf.dwEffects = 0;
+        cf.crBackColor = highlightYellow;
+    }
+    SendMessageW(hRich, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    SetFocus(hRich);
+}
+
 // 插入图片到富文本笔记
 inline void InsertImageFromFile(HWND hwnd, HWND hRich) {
     wchar_t szFile[MAX_PATH] = { 0 };

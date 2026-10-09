@@ -61,10 +61,10 @@ inline LayoutMetrics GetMetrics(UINT dpi) {
     m.itemH = ScaleDpi(42, dpi);
     m.formatBarH = ScaleDpi(40, dpi);
     m.padding = ScaleDpi(14, dpi);
-    m.headerBtnW = ScaleDpi(28, dpi);
-    m.headerBtnH = ScaleDpi(28, dpi);
-    m.fmtBtnW = ScaleDpi(34, dpi);
-    m.fmtBtnH = ScaleDpi(30, dpi);
+    m.headerBtnW = ScaleDpi(26, dpi);
+    m.headerBtnH = ScaleDpi(26, dpi);
+    m.fmtBtnW = ScaleDpi(30, dpi);
+    m.fmtBtnH = ScaleDpi(28, dpi);
     m.fmtBtnPad = ScaleDpi(4, dpi);
     return m;
 }
@@ -79,11 +79,13 @@ inline RECT GetFormatBtnRect(int width, int height, int index, UINT dpi) {
 inline RECT GetHeaderBtnRect(int width, int index, UINT dpi) {
     LayoutMetrics m = GetMetrics(dpi);
     int btnY = (m.headerH - m.headerBtnH) / 2;
-    int x3 = width - ScaleDpi(34, dpi);
-    int x2 = width - ScaleDpi(68, dpi);
-    int x1 = width - ScaleDpi(102, dpi);
+    int x4 = width - ScaleDpi(32, dpi);
+    int x3 = width - ScaleDpi(64, dpi);
+    int x2 = width - ScaleDpi(96, dpi);
+    int x1 = width - ScaleDpi(128, dpi);
     if (index == 1) return { x1, btnY, x1 + m.headerBtnW, btnY + m.headerBtnH };
     if (index == 2) return { x2, btnY, x2 + m.headerBtnW, btnY + m.headerBtnH };
     if (index == 3) return { x3, btnY, x3 + m.headerBtnW, btnY + m.headerBtnH };
+    if (index == 4) return { x4, btnY, x4 + m.headerBtnW, btnY + m.headerBtnH };
     return { 0, 0, 0, 0 };
 }

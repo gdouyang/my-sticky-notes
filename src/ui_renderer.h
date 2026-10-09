@@ -21,7 +21,7 @@ inline void DrawModernRoundRect(HDC hdc, const RECT& rc, int radius, COLORREF fi
 }
 
 // 统计待办进度
-inline void GetTodoStats(const AppData& appData, int& completed, int& total, float& percent) {
+inline void GetTodoStats(const NoteCardData& appData, int& completed, int& total, float& percent) {
     total = (int)appData.todos.size();
     completed = 0;
     for (const auto& item : appData.todos) {
@@ -34,7 +34,7 @@ inline void GetTodoStats(const AppData& appData, int& completed, int& total, flo
 inline void RenderView(
     HDC memDC,
     const RECT& clientRc,
-    const AppData& appData,
+    const NoteCardData& appData,
     int scrollOffset,
     int hoveredItemIdx,
     int hoveredDeleteIdx,
@@ -71,15 +71,26 @@ inline void RenderView(
     SetBkMode(memDC, TRANSPARENT);
     SelectObject(memDC, hFontTitle);
     SetTextColor(memDC, colors.textPrimary);
-    RECT titleRc = { m.padding, 0, width - ScaleDpi(120, dpi), m.headerH };
+    RECT titleRc = { m.padding, 0, width - ScaleDpi(145, dpi), m.headerH };
     DrawTextW(memDC, L"便笺与进度", -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-    // 顶部按钮区: [📌 置顶] [🎨 换色] [× 隐藏]
+    // 顶部按钮区: [+] [📌 置顶] [🎨 换色] [× 隐藏/关闭]
     int btnRadius = ScaleDpi(6, dpi);
 
-    // 置顶
-    RECT pinBtnRc = GetHeaderBtnRect(width, 1, dpi);
-    if (hoveredHeaderBtn == 1 || appData.isAlwaysOnTop) {
+    // 1. 新建便签 [+]
+    RECT addBtnRc = GetHeaderBtnRect(width, 1, dpi);
+    if (hoveredHeaderBtn == 1) {
+        DrawModernRoundRect(memDC, addBtnRc, btnRadius, colors.hoverOverlay, colors.cardBorder);
+        SetTextColor(memDC, colors.textPrimary);
+    } else {
+        SetTextColor(memDC, colors.textSecondary);
+    }
+    SelectObject(memDC, hFontTitle);
+    DrawTextW(memDC, L"+", -1, &addBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+    // 2. 置顶 [📌]
+    RECT pinBtnRc = GetHeaderBtnRect(width, 2, dpi);
+    if (hoveredHeaderBtn == 2 || appData.isAlwaysOnTop) {
         DrawModernRoundRect(memDC, pinBtnRc, btnRadius, appData.isAlwaysOnTop ? colors.accent : colors.hoverOverlay, colors.cardBorder);
         SetTextColor(memDC, appData.isAlwaysOnTop ? RGB(255, 255, 255) : colors.textPrimary);
     } else {
@@ -88,17 +99,17 @@ inline void RenderView(
     SelectObject(memDC, hFontNormal);
     DrawTextW(memDC, L"📌", -1, &pinBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    // 换色
-    RECT themeBtnRc = GetHeaderBtnRect(width, 2, dpi);
-    if (hoveredHeaderBtn == 2) {
+    // 3. 换色 [🎨]
+    RECT themeBtnRc = GetHeaderBtnRect(width, 3, dpi);
+    if (hoveredHeaderBtn == 3) {
         DrawModernRoundRect(memDC, themeBtnRc, btnRadius, colors.hoverOverlay, colors.cardBorder);
     }
     SetTextColor(memDC, colors.textSecondary);
     DrawTextW(memDC, L"🎨", -1, &themeBtnRc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-    // 隐藏
-    RECT closeBtnRc = GetHeaderBtnRect(width, 3, dpi);
-    if (hoveredHeaderBtn == 3) {
+    // 4. 关闭/隐藏 [×]
+    RECT closeBtnRc = GetHeaderBtnRect(width, 4, dpi);
+    if (hoveredHeaderBtn == 4) {
         DrawModernRoundRect(memDC, closeBtnRc, btnRadius, RGB(254, 226, 226), RGB(248, 113, 113));
         SetTextColor(memDC, RGB(220, 38, 38));
     } else {
@@ -274,7 +285,7 @@ inline void RenderView(
         SelectObject(memDC, prevFmtPen);
         DeleteObject(fmtPen);
 
-        for (int b = 1; b <= 6; ++b) {
+        for (int b = 1; b <= 7; ++b) {
             RECT bRc = GetFormatBtnRect(width, height, b, dpi);
             if (hoveredFmtBtn == b) {
                 DrawModernRoundRect(memDC, bRc, ScaleDpi(5, dpi), colors.hoverOverlay, colors.cardBorder);
@@ -349,6 +360,21 @@ inline void RenderView(
                 DeleteObject(linePen);
                 DeleteObject(dotBrush);
             } else if (b == 6) {
+                // 荧光高亮笔 (A 字母底下带荧光黄色粗底条)
+                SetTextColor(memDC, colors.textPrimary);
+                SelectObject(memDC, hFontFmtB);
+                RECT r = bRc;
+                r.bottom -= ScaleDpi(5, dpi);
+                DrawTextW(memDC, L"A", 1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+                int barH = ScaleDpi(3, dpi); if (barH < 2) barH = 2;
+                int barW = ScaleDpi(14, dpi);
+                int barY = cy + ScaleDpi(6, dpi);
+                RECT hlRc = { cx - barW / 2, barY, cx + barW / 2, barY + barH };
+                HBRUSH hlBrush = CreateSolidBrush(RGB(253, 224, 71));
+                FillRect(memDC, &hlRc, hlBrush);
+                DeleteObject(hlBrush);
+            } else if (b == 7) {
                 // 添加图像 (精致相框 + 山峰)
                 int fHalfW = ScaleDpi(8, dpi);
                 int fHalfH = ScaleDpi(6, dpi);

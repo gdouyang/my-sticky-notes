@@ -20,13 +20,14 @@ my-sticky-notes/
 ├── src/
 │   ├── app.manifest         # 应用程序清单（声明 PerMonitorV2 高 DPI 与通用控件 v6）
 │   ├── resource.rc          # Windows 资源脚本（内嵌清单及未来图标）
-│   ├── data_store.h/.cpp    # 数据存储层（数据模型定义、JSON 序列化与磁盘持久化）
+│   ├── autostart.h          # 开机自启管理模块（Windows 注册表 Run 键探测与切换）
+│   ├── data_store.h/.cpp    # 数据存储层（NoteCardData/AppData 多便签模型、JSON 序列化与 RTF 磁盘分流持久化）
 │   ├── ui_theme.h           # 主题色板系统（6套现代微拟物与 Fluent 配色方案）
-│   ├── dpi_layout.h         # DPI 缩放与几何布局引擎（动态 DPI 换算、尺寸度量与按钮区域计算）
-│   ├── rich_text_utils.h    # 富文本排版与交互层（RTF 流、粗体/斜体/下划线、项目符号与图片插入）
-│   ├── ui_renderer.h        # 视图渲染层（GDI 双缓冲自绘卡片、Header、进度条、格式图标）
-│   ├── tray.h/.cpp          # 系统托盘管理（自绘托盘图标、托盘消息与右键菜单）
-│   └── main.cpp             # 主程序入口与消息泵（窗口生命周期、消息分发与命中测试）
+│   ├── dpi_layout.h         # DPI 缩放与几何布局引擎（动态 DPI 换算、尺寸度量与 Header/Format 按钮区域计算）
+│   ├── rich_text_utils.h    # 富文本排版与交互层（RTF 流、粗斜体下划线、项目符号、图片与荧光笔高亮）
+│   ├── ui_renderer.h        # 视图渲染层（GDI 双缓冲自绘卡片、Header 按钮自绘、进度条、格式图标与荧光笔）
+│   ├── tray.h/.cpp          # 系统托盘管理（自绘托盘图标、托盘消息、右键菜单包含透明度/开机自启/多便签联动）
+│   └── main.cpp             # 主程序入口与消息泵（窗口生命周期、多卡片 NoteWindowContext、待办内联编辑、超链接跳转、贴边收起）
 ├── build.bat                # 自动化编译构建脚本（windres + g++ 链接）
 ├── AGENTS.md                # 架构约定与 Agent 开发规范（本文件）
 └── README.md                # 项目简介与使用文档

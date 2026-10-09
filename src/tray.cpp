@@ -94,15 +94,29 @@ bool TrayManager::RemoveTrayIcon(HWND hwnd) {
     return Shell_NotifyIconW(NIM_DELETE, &nid) != FALSE;
 }
 
-void TrayManager::ShowContextMenu(HWND hwnd, bool isTopMost, int currentTheme) {
+void TrayManager::ShowContextMenu(HWND hwnd, bool isTopMost, int currentTheme, int opacity, bool autostart) {
     POINT pt;
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu) return;
 
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_NEW_NOTE, L"新建便签 (&N)");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
     bool isVisible = IsWindowVisible(hwnd) != FALSE;
-    AppendMenuW(hMenu, MF_STRING, isVisible ? ID_TRAY_HIDE : ID_TRAY_SHOW, isVisible ? L"隐藏便签" : L"显示便签");
-    AppendMenuW(hMenu, MF_STRING | (isTopMost ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_TOPMOST, L"总是置顶");
+    AppendMenuW(hMenu, MF_STRING, isVisible ? ID_TRAY_HIDE : ID_TRAY_SHOW, isVisible ? L"隐藏当前便签" : L"显示当前便签");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_ALL, L"显示所有便签");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ALL, L"收起所有便签");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
+    AppendMenuW(hMenu, MF_STRING | (isTopMost ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_TOPMOST, L"当前便签置顶");
+
+    // 不透明度二级子菜单
+    HMENU hOpacitySubMenu = CreatePopupMenu();
+    AppendMenuW(hOpacitySubMenu, MF_STRING | (opacity >= 98 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_OPACITY_100, L"100% (默认)");
+    AppendMenuW(hOpacitySubMenu, MF_STRING | ((opacity >= 88 && opacity < 98) ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_OPACITY_90, L"90% 柔和半透");
+    AppendMenuW(hOpacitySubMenu, MF_STRING | (opacity < 88 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_OPACITY_80, L"80% 极简透视");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hOpacitySubMenu, L"窗口透明度");
 
     // 颜色主题二级子菜单
     HMENU hColorSubMenu = CreatePopupMenu();
@@ -114,9 +128,11 @@ void TrayManager::ShowContextMenu(HWND hwnd, bool isTopMost, int currentTheme) {
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hColorSubMenu, L"主题色彩");
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING | (autostart ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_AUTOSTART, L"开机自启动");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出程序");
 
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(hMenu);
 }
+
