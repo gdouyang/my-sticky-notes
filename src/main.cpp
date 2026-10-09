@@ -266,13 +266,13 @@ void UpdateFontsForDpi(UINT dpi) {
     if (g_hFontFmtU) DeleteObject(g_hFontFmtU);
     if (g_hFontFmtAB) DeleteObject(g_hFontFmtAB);
 
-    int titleH = ScaleDpi(17, dpi);
-    int normalH = ScaleDpi(16, dpi);
-    int smallH = ScaleDpi(13, dpi);
-    int fmtBH = ScaleDpi(17, dpi);
-    int fmtIH = ScaleDpi(18, dpi);
-    int fmtUH = ScaleDpi(16, dpi);
-    int fmtABH = ScaleDpi(16, dpi);
+    int titleH = ScaleDpi(16, dpi);
+    int normalH = ScaleDpi(15, dpi);
+    int smallH = ScaleDpi(12, dpi);
+    int fmtBH = ScaleDpi(16, dpi);
+    int fmtIH = ScaleDpi(17, dpi);
+    int fmtUH = ScaleDpi(15, dpi);
+    int fmtABH = ScaleDpi(15, dpi);
 
     g_hFontTitle = CreateFontW(-titleH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -309,8 +309,10 @@ void UpdateFontsForDpi(UINT dpi) {
     if (g_hEditInput) {
         SendMessage(g_hEditInput, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
     }
-    // 注意：严禁对富文本 g_hRichMemo 发送 WM_SETFONT 消息！
-    // Win32 RichEdit 接收 WM_SETFONT 会彻底重置整个文档为纯文本并擦除加粗、斜体、下划线等所有样式。
+    // 恢复富文本 1:1 默认缩放，避免在 PerMonitorV2 系统自适配上产生二次叠加放大
+    if (g_hRichMemo) {
+        SendMessage(g_hRichMemo, EM_SETZOOM, 0, 0);
+    }
 }
 
 // 同步主题配色到内部编辑控件（解决暗色/亮色切换时字体颜色失配看不见的问题）
