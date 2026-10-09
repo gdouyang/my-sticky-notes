@@ -1,1 +1,5 @@
-﻿1 24 "src/app.manifest"
+// 应用程序图标（ID 1 为 Windows 资源管理器默认优先提取并展示的 exe 图标）
+1 ICON "src/app.ico"
+
+// PerMonitorV2 高 DPI 与公共控件清单
+1 24 "src/app.manifest"
